@@ -205,6 +205,13 @@ impl Model for ModelWrapper {
             Self::Unigram(t) => t.get_trainer().into(),
         }
     }
+
+    fn flush_cache(&self) {
+        match self {
+            Self::BPE(t) => t.flush_cache(),
+            _ => {}
+        }
+    }
 }
 
 impl ModelWrapper {

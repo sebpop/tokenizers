@@ -85,6 +85,8 @@ pub trait Model {
     fn save(&self, folder: &Path, prefix: Option<&str>) -> Result<Vec<PathBuf>>;
     /// Get an instance of a Trainer capable of training this Model
     fn get_trainer(&self) -> <Self as Model>::Trainer;
+    /// Flush any per-thread cache buffer into the shared cache. No-op for models without a cache.
+    fn flush_cache(&self) {}
 }
 
 /// A `PostProcessor` has the responsibility to post process an encoded output of the `Tokenizer`.
@@ -800,7 +802,9 @@ where
             .transpose()?;
 
         // And finally post process
-        self.post_process(encoding, pair_encoding, add_special_tokens)
+        let out = self.post_process(encoding, pair_encoding, add_special_tokens);
+        self.model.flush_cache();
+        out
     }
 
     /// Encode the given input. This method accepts both single sequences, as well as pair
@@ -842,7 +846,9 @@ where
             .transpose()?;
 
         // And finally post process
-        self.post_process(encoding, pair_encoding, add_special_tokens)
+        let out = self.post_process(encoding, pair_encoding, add_special_tokens);
+        self.model.flush_cache();
+        out
     }
 
     /// Encode the given input, using offsets relative to chars instead of bytes.
@@ -885,7 +891,9 @@ where
             .transpose()?;
 
         // And finally post process
-        self.post_process(encoding, pair_encoding, add_special_tokens)
+        let out = self.post_process(encoding, pair_encoding, add_special_tokens);
+        self.model.flush_cache();
+        out
     }
 
     /// Decode the given ids, back to a String

@@ -6,6 +6,7 @@ use ahash::AHashMap;
 use serde_json::Value;
 use std::borrow::Cow;
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::{
     fs::File,
@@ -13,6 +14,22 @@ use std::{
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
 };
+
+/// Per-thread BPE cache state: a write buffer for batching inserts into the
+/// global sharded cache, and a read cache that avoids RwLock atomics on
+/// repeated lookups.
+struct BpeLocalCache {
+    /// Pending inserts to flush into the global sharded cache.
+    write_buf: AHashMap<String, Word>,
+    /// Read-side cache: entries promoted from the global cache on first hit
+    /// so that subsequent lookups on the same thread need no RwLock at all.
+    read_cache: AHashMap<String, Word>,
+}
+
+thread_local!(static BPE_LOCAL: RefCell<BpeLocalCache> = RefCell::new(BpeLocalCache {
+    write_buf: AHashMap::new(),
+    read_cache: AHashMap::new(),
+}));
 
 pub type Vocab = AHashMap<String, u32>;
 type VocabR = AHashMap<u32, String>;
@@ -482,17 +499,48 @@ impl BPE {
                 )]);
             }
         }
-        if let Some(ref hit) = self.cache.as_ref().and_then(|c| c.get(sequence)) {
-            return Ok(self.word_to_tokens(hit).collect());
-        }
-        let word = self.merge_word(sequence)?;
-        let ret = self.word_to_tokens(&word).collect();
-        if let Some(ref cache) = self.cache {
-            if sequence.len() < MAX_LENGTH {
-                cache.set(sequence.to_owned(), word);
+        BPE_LOCAL.with(|cell| {
+            let mut local = cell.borrow_mut();
+
+            // 1. Thread-local read cache: zero synchronization.
+            if let Some(ref hit) = local.read_cache.get(sequence) {
+                return Ok(self.word_to_tokens(hit).collect());
             }
+
+            // 2. Thread-local write buffer: zero synchronization.
+            if let Some(ref hit) = local.write_buf.get(sequence) {
+                return Ok(self.word_to_tokens(hit).collect());
+            }
+
+            // 3. Cache miss: compute BPE and store in thread-local cache only.
+            //    We avoid the global sharded cache (RwLock) here to remove
+            //    atomic synchronization (e.g. __aarch64_cas4_acq) from the hot path.
+            let word = self.merge_word(sequence)?;
+            let ret = self.word_to_tokens(&word).collect();
+            if sequence.len() < MAX_LENGTH {
+                let cap = self
+                    .cache
+                    .as_ref()
+                    .map(|c| c.capacity)
+                    .unwrap_or(DEFAULT_CACHE_CAPACITY);
+                if local.read_cache.len() >= cap {
+                    local.read_cache.clear();
+                }
+                local.read_cache.insert(sequence.to_owned(), word);
+            }
+            Ok(ret)
+        })
+    }
+
+    /// Flush thread-local write buffer into the global cache.
+    /// Call after encoding one input.
+    pub fn flush_cache(&self) {
+        if let Some(ref cache) = self.cache {
+            BPE_LOCAL.with(|cell| {
+                let mut local = cell.borrow_mut();
+                cache.flush_buf(&mut local.write_buf);
+            });
         }
-        Ok(ret)
     }
 }
 
