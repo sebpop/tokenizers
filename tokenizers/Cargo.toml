@@ -34,6 +34,12 @@ path = "src/lib.rs"
 bench = false
 
 [[bench]]
+name = "throughput_bench"
+required-features = ["http"]
+harness = false
+
+
+[[bench]]
 name = "bpe_benchmark"
 harness = false
 
