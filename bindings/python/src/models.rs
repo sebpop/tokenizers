@@ -14,6 +14,7 @@ use tk::models::unigram::Unigram;
 use tk::models::wordlevel::WordLevel;
 use tk::models::wordpiece::{WordPiece, WordPieceBuilder};
 use tk::models::ModelWrapper;
+use tk::tokenizer::PreTokenizedString;
 use tk::{Model, Token};
 use tokenizers as tk;
 
@@ -49,6 +50,21 @@ impl Model for PyModel {
 
     fn tokenize(&self, tokens: &str) -> tk::Result<Vec<Token>> {
         self.model.read().unwrap().tokenize(tokens)
+    }
+
+    /// Tokenize all pre-tokens under a single read-lock acquisition.
+    ///
+    /// The default `Model` implementation calls `tokenize()` per pre-token,
+    /// each of which acquires `Arc<RwLock>::read()` (an atomic ldadd/ldsub on
+    /// ARM).  With ~1500 pre-tokens per document this adds significant
+    /// overhead.  By overriding here we acquire the lock once and tokenize
+    /// every pre-token under the same guard.
+    fn tokenize_in_pretokenized(
+        &self,
+        pretokenized: &mut PreTokenizedString,
+    ) -> tk::Result<()> {
+        let guard = self.model.read().unwrap();
+        pretokenized.tokenize(|normalized| guard.tokenize(normalized.get()))
     }
 
     fn token_to_id(&self, token: &str) -> Option<u32> {

@@ -88,6 +88,16 @@ pub trait Model {
     fn get_trainer(&self) -> <Self as Model>::Trainer;
     /// Flush any per-thread cache buffer into the shared cache. No-op for models without a cache.
     fn flush_cache(&self) {}
+
+    /// Tokenize all pre-tokens within a `PreTokenizedString`.
+    ///
+    /// The default calls `self.tokenize()` per pre-token.  Models that are
+    /// wrapped in a lock (e.g. `PyModel` with `Arc<RwLock<_>>`) can override
+    /// this to acquire the lock once for the entire batch of pre-tokens,
+    /// avoiding per-call atomic overhead.
+    fn tokenize_in_pretokenized(&self, pretokenized: &mut PreTokenizedString) -> Result<()> {
+        pretokenized.tokenize(|normalized| self.tokenize(normalized.get()))
+    }
 }
 
 /// A `PostProcessor` has the responsibility to post process an encoded output of the `Tokenizer`.
@@ -1161,7 +1171,7 @@ where
                     *max_length,
                     *direction,
                 )?,
-            _ => pretokenized.tokenize(|normalized| self.model.tokenize(normalized.get()))?,
+            _ => self.model.tokenize_in_pretokenized(&mut pretokenized)?,
         }
         pretokenized.into_encoding(word_idx, type_id, offsets_type)
     }
