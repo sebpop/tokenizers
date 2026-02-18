@@ -69,6 +69,7 @@ name = "truncation_benchmark"
 harness = false
 
 [dependencies]
+mimalloc = { version = "0.1", optional = true }
 rand = "0.9"
 onig = { version = "6.5.1", default-features = false, optional = true }
 regex = "1.10"
@@ -101,10 +102,11 @@ dary_heap = { version = "0.3.6", features = ["serde"] }
 compact_str = { version = "0.9", features = ["serde"] }
 
 [features]
-default = ["progressbar", "onig", "esaxx_fast"]
+default = ["progressbar", "onig", "esaxx_fast", "mimalloc"]
 esaxx_fast = ["esaxx-rs/cpp"]
 progressbar = ["indicatif"]
 http = ["hf-hub"]
+mimalloc = ["dep:mimalloc"]
 unstable_wasm = ["fancy-regex", "getrandom/wasm_js"]
 rustls-tls = ["hf-hub?/rustls-tls"]
 

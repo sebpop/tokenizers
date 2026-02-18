@@ -130,6 +130,16 @@
 //!
 //! - **http**: This feature enables downloading the tokenizer via HTTP. It is disabled by default.
 //!   With this feature enabled, `Tokenizer::from_pretrained` becomes accessible.
+//!
+//! - **mimalloc**: Uses [mimalloc](https://github.com/microsoft/mimalloc) as the global allocator (default).
+//!   Reduces malloc/free contention on multi-threaded workloads. Disable with `--no-default-features` if needed.
+
+#[cfg(feature = "mimalloc")]
+use mimalloc::MiMalloc;
+
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 #[macro_use]
 extern crate log;
