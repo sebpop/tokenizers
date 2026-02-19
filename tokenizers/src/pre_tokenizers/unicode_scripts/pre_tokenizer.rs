@@ -1,6 +1,7 @@
 use crate::pre_tokenizers::unicode_scripts::scripts::{get_script, Script};
-use crate::tokenizer::{normalizer::Range, PreTokenizedString, PreTokenizer, Result};
+use crate::tokenizer::{normalizer::Range, NormalizedString, PreTokenizedString, PreTokenizer, Result};
 use crate::utils::macro_rules_attribute;
+use std::cell::RefCell;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[macro_rules_attribute(impl_serde_type!)]
@@ -37,6 +38,11 @@ fn fixed_script(c: char) -> Script {
     }
 }
 
+// Thread-local pool of NormalizedString buffers to reuse in slice_into (avoids ~2% _mi_page_malloc in slice).
+thread_local! {
+    static SLICE_POOL: RefCell<Vec<NormalizedString>> = RefCell::new(Vec::new());
+}
+
 impl PreTokenizer for UnicodeScripts {
     fn pre_tokenize(&self, pretokenized: &mut PreTokenizedString) -> Result<()> {
         pretokenized.split(|_, normalized| {
@@ -64,14 +70,23 @@ impl PreTokenizer for UnicodeScripts {
                 })
                 .collect();
             ranges.push(normalized.get().len());
-            Ok(ranges
-                .windows(2)
-                .map(|item| {
+            let segments: Vec<(usize, usize)> = ranges.windows(2).map(|w| (w[0], w[1])).collect();
+            let result = SLICE_POOL.with(|cell| {
+                let mut pool = cell.borrow_mut();
+                let mut buf0 = pool.pop().unwrap_or_default();
+                let mut buf1 = pool.pop().unwrap_or_default();
+                let mut out = Vec::with_capacity(segments.len());
+                for (start, end) in segments {
                     normalized
-                        .slice(Range::Normalized(item[0]..item[1]))
-                        .expect("NormalizedString bad split")
-                })
-                .collect::<Vec<_>>())
+                        .slice_into(Range::Normalized(start..end), &mut buf0)
+                        .expect("NormalizedString bad split");
+                    out.push(std::mem::replace(&mut buf0, std::mem::take(&mut buf1)));
+                }
+                pool.push(buf0);
+                pool.push(buf1);
+                out
+            });
+            Ok(result)
         })
     }
 }

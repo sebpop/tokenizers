@@ -1,6 +1,7 @@
 use crate::normalizer::Range;
-use crate::tokenizer::{PreTokenizedString, PreTokenizer, Result};
+use crate::tokenizer::{NormalizedString, PreTokenizedString, PreTokenizer, Result};
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 
 use crate::utils::macro_rules_attribute;
 
@@ -21,6 +22,11 @@ fn default_length() -> usize {
     5
 }
 
+// Thread-local pool of NormalizedString buffers to reuse in slice_into (avoids per-slice allocations).
+thread_local! {
+    static SLICE_POOL: RefCell<Vec<NormalizedString>> = RefCell::new(Vec::new());
+}
+
 impl PreTokenizer for FixedLength {
     fn pre_tokenize(&self, pretokenized: &mut PreTokenizedString) -> Result<()> {
         pretokenized.split(|_, normalized| {
@@ -29,22 +35,35 @@ impl PreTokenizer for FixedLength {
                 return Ok(vec![]);
             }
 
-            let mut splits = Vec::new();
             let char_positions: Vec<_> = text.char_indices().collect();
-            for chunk in char_positions.chunks(self.length) {
-                let start = chunk.first().map(|(i, _)| *i).unwrap_or(0);
-                let end = chunk
-                    .last()
-                    .map(|(i, c)| i + c.len_utf8())
-                    .unwrap_or(text.len());
-                splits.push(
-                    normalized
-                        .slice(Range::Normalized(start..end))
-                        .ok_or("Failed to slice normalized text")?,
-                );
-            }
+            let segments: Vec<(usize, usize)> = char_positions
+                .chunks(self.length)
+                .map(|chunk| {
+                    let start = chunk.first().map(|(i, _)| *i).unwrap_or(0);
+                    let end = chunk
+                        .last()
+                        .map(|(i, c)| i + c.len_utf8())
+                        .unwrap_or(text.len());
+                    (start, end)
+                })
+                .collect();
 
-            Ok(splits)
+            let result = SLICE_POOL.with(|cell| {
+                let mut pool = cell.borrow_mut();
+                let mut buf0 = pool.pop().unwrap_or_default();
+                let mut buf1 = pool.pop().unwrap_or_default();
+                let mut out = Vec::with_capacity(segments.len());
+                for (start, end) in segments {
+                    normalized
+                        .slice_into(Range::Normalized(start..end), &mut buf0)
+                        .ok_or("Failed to slice normalized text")?;
+                    out.push(std::mem::replace(&mut buf0, std::mem::take(&mut buf1)));
+                }
+                pool.push(buf0);
+                pool.push(buf1);
+                Ok(out)
+            });
+            result
         })
     }
 }

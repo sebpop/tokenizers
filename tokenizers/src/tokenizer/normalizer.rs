@@ -1,9 +1,15 @@
 use crate::pattern::Pattern;
 use crate::{Offsets, Result};
+use std::cell::RefCell;
 use std::ops::{Bound, RangeBounds};
 use unicode_normalization_alignments::UnicodeNormalization;
 
 use serde::{Deserialize, Serialize};
+
+// Thread-local pool of two NormalizedString buffers for split() to reuse via slice_into.
+thread_local! {
+    static SLICE_POOL: RefCell<Vec<NormalizedString>> = RefCell::new(Vec::new());
+}
 
 /// The possible offsets referential
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,9 +109,9 @@ impl std::fmt::Display for SplitDelimiterBehavior {
 /// possible to convert offsets from one referential to the other one easily.
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub struct NormalizedString {
-    /// The original version of the string, before any modification
+    /// The original version of the string, before any modification.
     original: String,
-    /// The normalized version of the string, after all modifications
+    /// The normalized version of the string, after all modifications.
     normalized: String,
     /// Mapping from normalized string to original one: (start, end) for each
     /// byte of the normalized string
@@ -267,9 +273,29 @@ impl NormalizedString {
         }
     }
 
-    /// Return a slice of the current NormalizedString
-    /// If the range is not on char boundaries, return None
+    /// Return a slice of the current NormalizedString.
+    /// If the range is not on char boundaries, return None.
+    ///
+    /// **Allocations:** This allocates a new `NormalizedString` (two `String`s and one
+    /// `Vec<(usize, usize)>` for alignments). For hot paths that slice repeatedly, use
+    /// [`slice_into`](Self::slice_into) with a reused buffer (e.g. from a thread-local pool).
     pub fn slice<T>(&self, range: Range<T>) -> Option<NormalizedString>
+    where
+        T: RangeBounds<usize> + Clone,
+    {
+        let mut dest = NormalizedString::default();
+        self.slice_into(range, &mut dest)?;
+        Some(dest)
+    }
+
+    /// Write a slice of the current NormalizedString into `dest`, reusing its buffers.
+    /// If the range is not on char boundaries, return None. Callers can reuse `dest`
+    /// across multiple slice_into calls to avoid per-slice allocations.
+    ///
+    /// **Allocations:** If `dest`'s buffers are too small, `push_str` / `extend` will
+    /// grow them (causing _mi_page_malloc in profiler). We reserve before clear so
+    /// a single allocation per buffer suffices when capacity was too low.
+    pub fn slice_into<T>(&self, range: Range<T>, dest: &mut NormalizedString) -> Option<()>
     where
         T: RangeBounds<usize> + Clone,
     {
@@ -287,20 +313,25 @@ impl NormalizedString {
 
         let n_shift = original_range.start;
 
-        Some(Self {
-            original: self
-                .get_range_original(full_range.clone())
-                .unwrap_or_default()
-                .into(),
-            normalized: self.get_range(full_range).unwrap_or_default().into(),
-            alignments: self
-                .alignments
+        // Reserve so clear + push_str/extend don't reallocate (reduces _mi_page_malloc in hot path).
+        dest.original.reserve(original_range.len());
+        dest.normalized.reserve(normalized_range.len());
+        dest.alignments.reserve(normalized_range.len());
+
+        dest.original.clear();
+        dest.original.push_str(&self.original[original_range.clone()]);
+        dest.normalized.clear();
+        dest.normalized.push_str(&self.normalized[normalized_range.clone()]);
+        dest.alignments.clear();
+        dest.alignments.extend(
+            self.alignments
                 .get(normalized_range)?
                 .iter()
-                .map(|(start, end)| (start - n_shift, end - n_shift))
-                .collect(),
-            original_shift: self.original_shift + original_range.start,
-        })
+                .map(|(start, end)| (start - n_shift, end - n_shift)),
+        );
+        dest.original_shift = self.original_shift + original_range.start;
+
+        Some(())
     }
 
     /// Applies transformations to the current normalized version of the string,
@@ -413,18 +444,14 @@ impl NormalizedString {
 
         self.alignments.splice(n_range.clone(), alignments);
 
-        // This bounds check already happens above (`self.normalized[n_range.clone()]`), but future
-        // code could change to mutate `self` or `self.normalized` in the interim.
-        // Perform it again and hope the optimizer collapses it.
         assert!(self.normalized.get(n_range.clone()).is_some());
-        unsafe {
-            self.normalized
-                // Safety: This is safe as long as we do not splice across a
-                // UTF-8 character, and we only add UTF-8 text. `normalized` is a String
-                // so the latter is trivially true, and we assert for the former above.
-                .as_mut_vec()
-                .splice(n_range, normalized.bytes());
-        }
+        let new_normalized = [
+            &self.normalized[..n_range.start],
+            normalized.as_str(),
+            &self.normalized[n_range.end..],
+        ]
+        .concat();
+        self.normalized = new_normalized;
     }
 
     /// Applies transformations to the current normalized version of the string,
@@ -664,7 +691,7 @@ impl NormalizedString {
                 }
             });
 
-        // Copy the remaining part of the input
+        // Copy the remaining part of the input.
         new_normalized.push_str(&self.normalized[last_end..]);
         new_alignments.extend(&self.alignments[last_end..]);
 
@@ -766,20 +793,24 @@ impl NormalizedString {
             }
         };
 
-        // Then we split according to the computed splits
-        Ok(splits
-            .into_iter()
-            .filter_map(|(offsets, remove)| {
+        // Then we split according to the computed splits, reusing two buffers to avoid per-slice malloc.
+        let result = SLICE_POOL.with(|cell| {
+            let mut pool = cell.borrow_mut();
+            let mut buf0 = pool.pop().unwrap_or_default();
+            let mut buf1 = pool.pop().unwrap_or_default();
+            let mut out = Vec::new();
+            for (offsets, remove) in splits.into_iter() {
                 if !remove {
-                    Some(
-                        self.slice(Range::Normalized(offsets.0..offsets.1))
-                            .expect("NormalizedString bad split"),
-                    )
-                } else {
-                    None
+                    self.slice_into(Range::Normalized(offsets.0..offsets.1), &mut buf0)
+                        .expect("NormalizedString bad split");
+                    out.push(std::mem::replace(&mut buf0, std::mem::take(&mut buf1)));
                 }
-            })
-            .collect())
+            }
+            pool.push(buf0);
+            pool.push(buf1);
+            out
+        });
+        Ok(result)
     }
 
     /// Remove any leading space(s) of the normalized string
@@ -1004,9 +1035,11 @@ impl From<String> for NormalizedString {
                 (0..len).map(move |_| (b, b + len))
             })
             .collect::<Vec<_>>();
+        let original = s.clone();
+        let normalized = s;
         Self {
-            original: s.clone(),
-            normalized: s,
+            original,
+            normalized,
             alignments,
             original_shift: 0,
         }
