@@ -69,7 +69,8 @@ name = "truncation_benchmark"
 harness = false
 
 [dependencies]
-mimalloc = { version = "0.1", optional = true }
+# "override" makes mimalloc replace libc malloc/free so C deps (e.g. onig) use mimalloc too.
+mimalloc = { version = "0.1", optional = true, features = ["override"] }
 rand = "0.9"
 onig = { version = "6.5.1", default-features = false, optional = true }
 regex = "1.10"
