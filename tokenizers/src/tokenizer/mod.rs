@@ -98,6 +98,16 @@ pub trait Model {
     fn tokenize_in_pretokenized(&self, pretokenized: &mut PreTokenizedString) -> Result<()> {
         pretokenized.tokenize(|normalized| self.tokenize(normalized.get()))
     }
+
+    /// Map a batch of token IDs to their string representations in one call.
+    ///
+    /// The default calls `self.id_to_token()` per ID.  Models wrapped in a
+    /// lock (e.g. `PyModel` with `Arc<RwLock<_>>`) can override this to
+    /// acquire the lock once for the entire batch, avoiding per-call atomic
+    /// overhead on the decode hot path.
+    fn ids_to_tokens(&self, ids: &[u32]) -> Vec<Option<String>> {
+        ids.iter().map(|id| self.id_to_token(*id)).collect()
+    }
 }
 
 /// A `PostProcessor` has the responsibility to post process an encoded output of the `Tokenizer`.
@@ -907,14 +917,16 @@ where
         out
     }
 
-    /// Decode the given ids, back to a String
+    /// Decode the given ids, back to a String.
     pub fn decode(&self, ids: &[u32], skip_special_tokens: bool) -> Result<String> {
+        let model_tokens = self.model.ids_to_tokens(ids);
         let tokens = ids
             .iter()
-            .filter_map(|id| {
+            .zip(model_tokens)
+            .filter_map(|(id, model_token)| {
                 self.added_vocabulary
                     .simple_id_to_token(*id)
-                    .or_else(|| self.model.id_to_token(*id))
+                    .or(model_token)
                     .filter(|token| {
                         !skip_special_tokens || !self.added_vocabulary.is_special_token(token)
                     })

@@ -75,6 +75,17 @@ impl Model for PyModel {
         self.model.read().unwrap().id_to_token(id)
     }
 
+    /// Map a batch of token IDs to strings under a single read-lock acquisition.
+    ///
+    /// The default `Model` implementation calls `id_to_token()` per ID, each
+    /// of which acquires `Arc<RwLock>::read()` (an atomic ldadd/cas on ARM).
+    /// With hundreds of IDs per decode call this adds significant overhead.
+    /// By overriding here we acquire the lock once for all lookups.
+    fn ids_to_tokens(&self, ids: &[u32]) -> Vec<Option<String>> {
+        let guard = self.model.read().unwrap();
+        ids.iter().map(|id| guard.id_to_token(*id)).collect()
+    }
+
     fn get_vocab(&self) -> HashMap<String, u32> {
         self.model.read().unwrap().get_vocab()
     }

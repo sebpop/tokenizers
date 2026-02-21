@@ -101,6 +101,16 @@ impl tk::Model for Model {
     self.model.as_ref()?.read().unwrap().id_to_token(id)
   }
 
+  fn ids_to_tokens(&self, ids: &[u32]) -> Vec<Option<String>> {
+    match self.model.as_ref() {
+      Some(model) => {
+        let guard = model.read().unwrap();
+        ids.iter().map(|id| guard.id_to_token(*id)).collect()
+      }
+      None => vec![None; ids.len()],
+    }
+  }
+
   fn get_vocab(&self) -> HashMap<String, u32> {
     self
       .model
