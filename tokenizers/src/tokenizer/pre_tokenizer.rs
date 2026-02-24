@@ -2,7 +2,6 @@ use crate::{
     normalizer::Range, Encoding, NormalizedString, OffsetReferential, Offsets, Result, Token,
     TruncationDirection,
 };
-use std::collections::HashMap;
 
 /// Various possible types of offsets
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -326,37 +325,36 @@ impl From<String> for PreTokenizedString {
     }
 }
 
+/// Maps byte offsets to char offsets using a flat Vec instead of a HashMap.
+/// Byte offsets are dense integers 0..byte_len, so direct indexing is O(1)
+/// with no hashing overhead.
 struct BytesToCharOffsetConverter {
-    map: HashMap<usize, usize>,
+    table: Vec<usize>,
 }
 
 impl BytesToCharOffsetConverter {
     pub fn new(sequence: &str) -> Self {
-        Self {
-            map: sequence
-                .char_indices()
-                .enumerate()
-                .flat_map(|(i, (b, c))| {
-                    let mut n = 0;
-                    std::iter::repeat_with(move || {
-                        let o = (b + n, i);
-                        n += 1;
-                        o
-                    })
-                    .take(c.len_utf8())
-                })
-                .collect(),
+        let mut table = Vec::with_capacity(sequence.len());
+        for (char_idx, (_byte_offset, c)) in sequence.char_indices().enumerate() {
+            for _ in 0..c.len_utf8() {
+                table.push(char_idx);
+            }
         }
+        Self { table }
     }
 
     pub fn convert(&self, offsets: Offsets) -> Option<Offsets> {
-        match (self.map.get(&offsets.0), self.map.get(&offsets.1)) {
-            (Some(start), Some(end)) => Some((*start, *end)),
-            // If we reached the end, `end` is not in the map
-            (Some(start), None) => {
-                // But the one just before should be
-                let last = self.map.get(&(offsets.1 - 1)).copied().unwrap_or(start + 1);
-                Some((*start, last + 1))
+        let start = self.table.get(offsets.0).copied();
+        let end = self.table.get(offsets.1).copied();
+        match (start, end) {
+            (Some(s), Some(e)) => Some((s, e)),
+            (Some(s), None) => {
+                let last = self
+                    .table
+                    .get(offsets.1 - 1)
+                    .copied()
+                    .unwrap_or(s + 1);
+                Some((s, last + 1))
             }
             _ => None,
         }
