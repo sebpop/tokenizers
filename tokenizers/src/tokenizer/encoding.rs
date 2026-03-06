@@ -5,6 +5,17 @@ use crate::utils::truncation::TruncationDirection;
 use ahash::AHashMap;
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
+use std::sync::Mutex;
+
+/// Shared pool of cleared Encoding structs for reuse.
+///
+/// Workers take pre-allocated Encodings from this pool instead of
+/// calling `with_capacity` (which triggers 7 Vec allocations).
+/// Encodings are returned to the pool via `recycle()` or
+/// `recycle_vec()`, retaining their allocated capacity.
+static ENCODING_POOL: Mutex<Vec<Encoding>> = Mutex::new(Vec::new());
+
+const MAX_POOL_SIZE: usize = 2048;
 
 /// Represents the output of a `Tokenizer`.
 #[derive(Default, PartialEq, Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +77,48 @@ impl Encoding {
             attention_mask: Vec::with_capacity(len),
             overflowing: vec![],
             sequence_ranges: AHashMap::new(),
+        }
+    }
+
+    /// Take a cleared Encoding from the shared pool, or allocate a new one.
+    fn pooled_or_with_capacity(len: usize) -> Self {
+        if let Some(enc) = ENCODING_POOL.lock().unwrap().pop() {
+            return enc;
+        }
+        Self::with_capacity(len)
+    }
+
+    /// Clear all fields but retain allocated Vec capacity for reuse.
+    pub fn clear(&mut self) {
+        self.ids.clear();
+        self.type_ids.clear();
+        self.tokens.clear();
+        self.words.clear();
+        self.offsets.clear();
+        self.special_tokens_mask.clear();
+        self.attention_mask.clear();
+        self.overflowing.clear();
+        self.sequence_ranges.clear();
+    }
+
+    /// Return this Encoding to the shared pool for reuse.
+    pub fn recycle(mut self) {
+        self.clear();
+        let mut pool = ENCODING_POOL.lock().unwrap();
+        if pool.len() < MAX_POOL_SIZE {
+            pool.push(self);
+        }
+    }
+
+    /// Return a batch of Encodings to the shared pool.
+    pub fn recycle_vec(encodings: Vec<Self>) {
+        let mut pool = ENCODING_POOL.lock().unwrap();
+        for mut enc in encodings {
+            if pool.len() >= MAX_POOL_SIZE {
+                break;
+            }
+            enc.clear();
+            pool.push(enc);
         }
     }
 
@@ -545,7 +598,7 @@ impl std::iter::FromIterator<(u32, String, (usize, usize), Option<u32>, u32)> fo
         let items = iter.into_iter();
         let (lower, upper) = items.size_hint();
         let length = upper.unwrap_or(lower);
-        let mut encoding = Self::with_capacity(length);
+        let mut encoding = Self::pooled_or_with_capacity(length);
 
         for (id, token, offsets, word, type_id) in items {
             encoding.ids.push(id);

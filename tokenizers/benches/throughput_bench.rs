@@ -45,8 +45,11 @@ fn iter_throughput_batch(
     for _ in 0..iters {
         let batch = batch.to_vec();
         let start = Instant::now();
-        let _ = black_box(tokenizer.encode_batch_fast(batch, false));
+        let results = tokenizer.encode_batch_fast(batch, false).unwrap();
         duration = duration.checked_add(start.elapsed()).unwrap();
+        // Recycle Encodings to the shared pool so the next iteration
+        // reuses allocated Vec capacity instead of re-allocating.
+        tokenizers::Encoding::recycle_vec(results);
     }
     duration
 }
