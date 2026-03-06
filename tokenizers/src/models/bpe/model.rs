@@ -489,6 +489,14 @@ impl BPE {
             .map(move |(id, offsets)| Token::new(id, self.vocab_r[&id].clone(), offsets))
     }
 
+    /// Like `word_to_tokens` but uses empty Strings, avoiding
+    /// per-token `vocab_r[&id].clone()` allocations.
+    fn word_to_token_ids<'a>(&'a self, word: &'a Word) -> impl Iterator<Item = Token> + 'a {
+        word.get_chars_iter()
+            .zip(word.get_offsets_iter())
+            .map(move |(id, offsets)| Token::new(id, String::new(), offsets))
+    }
+
     fn tokenize_with_cache(&self, sequence: &str) -> Result<Vec<Token>> {
         if self.ignore_merges {
             if let Some(id) = self.vocab.get(sequence) {
@@ -517,6 +525,44 @@ impl BPE {
             //    atomic synchronization (e.g. __aarch64_cas4_acq) from the hot path.
             let word = self.merge_word(sequence)?;
             let ret = self.word_to_tokens(&word).collect();
+            if sequence.len() < MAX_LENGTH {
+                let cap = self
+                    .cache
+                    .as_ref()
+                    .map(|c| c.capacity)
+                    .unwrap_or(DEFAULT_CACHE_CAPACITY);
+                if local.read_cache.len() >= cap {
+                    local.read_cache.clear();
+                }
+                local.read_cache.insert(sequence.to_owned(), word);
+            }
+            Ok(ret)
+        })
+    }
+
+    fn tokenize_fast_with_cache(&self, sequence: &str) -> Result<Vec<Token>> {
+        if self.ignore_merges {
+            if let Some(id) = self.vocab.get(sequence) {
+                return Ok(vec![Token::new(
+                    *id,
+                    String::new(),
+                    (0, sequence.len()),
+                )]);
+            }
+        }
+        BPE_LOCAL.with(|cell| {
+            let mut local = cell.borrow_mut();
+
+            if let Some(ref hit) = local.read_cache.get(sequence) {
+                return Ok(self.word_to_token_ids(hit).collect());
+            }
+
+            if let Some(ref hit) = local.write_buf.get(sequence) {
+                return Ok(self.word_to_token_ids(hit).collect());
+            }
+
+            let word = self.merge_word(sequence)?;
+            let ret = self.word_to_token_ids(&word).collect();
             if sequence.len() < MAX_LENGTH {
                 let cap = self
                     .cache
@@ -565,6 +611,19 @@ impl Model for BPE {
         } else {
             let word = self.merge_word(sequence)?;
             Ok(self.word_to_tokens(&word).collect())
+        }
+    }
+
+    fn tokenize_fast(&self, sequence: &str) -> Result<Vec<Token>> {
+        if sequence.is_empty() {
+            return Ok(vec![]);
+        }
+
+        if self.dropout.is_none() || self.dropout == Some(0.0) {
+            self.tokenize_fast_with_cache(sequence)
+        } else {
+            let word = self.merge_word(sequence)?;
+            Ok(self.word_to_token_ids(&word).collect())
         }
     }
 

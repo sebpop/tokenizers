@@ -86,6 +86,13 @@ pub trait Model {
     fn save(&self, folder: &Path, prefix: Option<&str>) -> Result<Vec<PathBuf>>;
     /// Get an instance of a Trainer capable of training this Model
     fn get_trainer(&self) -> <Self as Model>::Trainer;
+    /// Like `tokenize`, but may skip populating `Token::value` with
+    /// the actual string.  Used by `encode_fast` (OffsetType::None)
+    /// where token text is never read.  The default just calls `tokenize`.
+    fn tokenize_fast(&self, sequence: &str) -> Result<Vec<Token>> {
+        self.tokenize(sequence)
+    }
+
     /// Flush any per-thread cache buffer into the shared cache. No-op for models without a cache.
     fn flush_cache(&self) {}
 
@@ -97,6 +104,12 @@ pub trait Model {
     /// avoiding per-call atomic overhead.
     fn tokenize_in_pretokenized(&self, pretokenized: &mut PreTokenizedString) -> Result<()> {
         pretokenized.tokenize(|normalized| self.tokenize(normalized.get()))
+    }
+
+    /// Like `tokenize_in_pretokenized`, but calls `tokenize_fast`
+    /// which may skip populating `Token::value`.
+    fn tokenize_in_pretokenized_fast(&self, pretokenized: &mut PreTokenizedString) -> Result<()> {
+        pretokenized.tokenize(|normalized| self.tokenize_fast(normalized.get()))
     }
 
     /// Map a batch of token IDs to their string representations in one call.
@@ -1183,7 +1196,13 @@ where
                     *max_length,
                     *direction,
                 )?,
-            _ => self.model.tokenize_in_pretokenized(&mut pretokenized)?,
+            _ => match offsets_type {
+                OffsetType::None => {
+                    self.model
+                        .tokenize_in_pretokenized_fast(&mut pretokenized)?
+                }
+                _ => self.model.tokenize_in_pretokenized(&mut pretokenized)?,
+            },
         }
         pretokenized.into_encoding(word_idx, type_id, offsets_type)
     }
