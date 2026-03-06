@@ -73,5 +73,50 @@ fn bench_throughput(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_throughput);
+fn bench_decode(c: &mut Criterion) {
+    let tokenizer = Tokenizer::from_pretrained("gpt2", None)
+        .expect("from_pretrained(\"gpt2\") (requires --features http and network or HF cache)");
+
+    const CORPUS_CHARS: usize = 10_000_000;
+    const NUM_DOCS: usize = 1_000;
+    let docs = repeated_corpus_docs(CORPUS_CHARS, NUM_DOCS);
+    let batch: Vec<EncodeInput> = docs.into_iter().map(Into::into).collect();
+
+    let encodings = tokenizer.encode_batch_fast(batch, false).unwrap();
+    let token_id_seqs: Vec<Vec<u32>> = encodings
+        .iter()
+        .map(|e| e.get_ids().to_vec())
+        .collect();
+    let total_decoded_bytes: usize = token_id_seqs
+        .iter()
+        .map(|ids| tokenizer.decode(ids, false).unwrap().len())
+        .sum();
+    let decode_input: Vec<&[u32]> = token_id_seqs.iter().map(|v| v.as_slice()).collect();
+
+    eprintln!(
+        "Decode: {} seqs, {} total decoded bytes",
+        decode_input.len(),
+        total_decoded_bytes
+    );
+
+    let mut group = c.benchmark_group("decode-throughput");
+    group.throughput(Throughput::Bytes(total_decoded_bytes as u64));
+    group.sample_size(20);
+    group.measurement_time(Duration::from_secs(6));
+    group.bench_function("gpt2_decode_batch_10M_1000docs", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                let start = Instant::now();
+                let _ = black_box(tokenizer.decode_batch(&decode_input, false));
+                total += start.elapsed();
+            }
+            total
+        })
+    });
+
+    group.finish();
+}
+
+criterion_group!(benches, bench_throughput, bench_decode);
 criterion_main!(benches);
