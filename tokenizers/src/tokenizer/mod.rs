@@ -1454,7 +1454,10 @@ where
             .collect::<Result<Vec<Encoding>>>()
     }
 
-    /// Decode all sentences in parallel
+    /// Decode all sentences in parallel.
+    ///
+    /// Uses the barrier-based WorkPool to avoid crossbeam epoch
+    /// contention from rayon's idle work-stealing threads.
     pub fn decode_batch(
         &self,
         sentences: &[&[u32]],
@@ -1463,10 +1466,44 @@ where
     where
         M: Send + Sync,
     {
-        sentences
-            .into_maybe_par_iter()
-            .map(|sentence| self.decode(sentence, skip_special_tokens))
-            .collect()
+        let n = sentences.len();
+        if n == 0 {
+            return Ok(vec![]);
+        }
+
+        let pool = crate::utils::pool::global_pool();
+        let parallelism = get_parallelism();
+        let num_threads = if parallelism {
+            pool.num_threads().min(n)
+        } else {
+            1
+        };
+
+        if num_threads <= 1 {
+            return sentences
+                .iter()
+                .map(|sentence| self.decode(sentence, skip_special_tokens))
+                .collect();
+        }
+
+        let queue = BatchWorkQueue::new(n, num_threads);
+        let results: ResultVec<Result<String>> = ResultVec::new(n);
+
+        pool.broadcast(|tid| {
+            if tid >= num_threads {
+                return;
+            }
+            while let Some((start, end)) = queue.claim_window() {
+                for i in start..end {
+                    results.set(i, self.decode(sentences[i], skip_special_tokens));
+                }
+            }
+        });
+
+        results
+            .into_vec()
+            .into_iter()
+            .collect::<Result<Vec<String>>>()
     }
 
     /// Train our Model from files
