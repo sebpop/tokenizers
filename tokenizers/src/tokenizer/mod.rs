@@ -1394,8 +1394,8 @@ where
     /// Each thread claims a dynamically-sized window of items, processes them,
     /// and writes results directly to pre-allocated slots.
     ///
-    /// Uses `rayon::scope` to run on the existing rayon thread pool, avoiding
-    /// the cost of creating/destroying OS threads on every call.
+    /// Uses a barrier-based `WorkPool` instead of rayon to avoid
+    /// crossbeam epoch TLB misses that dominate at high core counts.
     fn run_batch<'s, E, F>(
         &self,
         inputs: Vec<E>,
@@ -1410,9 +1410,10 @@ where
             return Ok(vec![]);
         }
 
+        let pool = crate::utils::pool::global_pool();
         let parallelism = get_parallelism();
         let num_threads = if parallelism {
-            current_num_threads().min(n)
+            pool.num_threads().min(n)
         } else {
             1
         };
@@ -1435,16 +1436,15 @@ where
         let results: ResultVec<Result<Encoding>> = ResultVec::new(n);
         let queue = BatchWorkQueue::new(n, num_threads);
 
-        rayon::scope(|s| {
-            for _ in 0..num_threads {
-                s.spawn(|_| {
-                    while let Some((start, end)) = queue.claim_window() {
-                        for i in start..end {
-                            let input = inputs.take(i);
-                            results.set(i, encode_fn(self, input));
-                        }
-                    }
-                });
+        pool.broadcast(|tid| {
+            if tid >= num_threads {
+                return;
+            }
+            while let Some((start, end)) = queue.claim_window() {
+                for i in start..end {
+                    let input = inputs.take(i);
+                    results.set(i, encode_fn(self, input));
+                }
             }
         });
 
