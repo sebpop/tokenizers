@@ -108,13 +108,20 @@ static GLOBAL_POOL: OnceLock<WorkPool> = OnceLock::new();
 
 /// Returns a reference to the process-wide persistent thread pool.
 ///
-/// The pool is created lazily on first use, with one thread per
-/// available CPU core.
+/// The pool is created lazily on first use.  Thread count is
+/// determined by (in priority order):
+/// 1. `RAYON_NUM_THREADS` env var (for backward compatibility)
+/// 2. `std::thread::available_parallelism()` (number of CPUs)
 pub fn global_pool() -> &'static WorkPool {
     GLOBAL_POOL.get_or_init(|| {
-        let n = thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
+        let n = std::env::var("RAYON_NUM_THREADS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| {
+                thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1)
+            });
         WorkPool::new(n)
     })
 }
