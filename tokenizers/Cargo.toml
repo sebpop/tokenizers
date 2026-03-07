@@ -94,7 +94,8 @@ aho-corasick = "1.1"
 paste = "1.0.14"
 macro_rules_attribute = "0.2.0"
 thiserror = "2"
-fancy-regex = { version = "0.17", optional = true }
+fancy-regex = { version = "0.17", optional = true}
+pcre2-sys = { version = "0.2", optional = true }
 getrandom = { version = "0.3" }
 esaxx-rs = { version = "0.1.10", default-features = false, features = [] }
 monostate = "0.1.12"
@@ -109,6 +110,7 @@ progressbar = ["indicatif"]
 http = ["hf-hub"]
 mimalloc = ["dep:mimalloc"]
 unstable_wasm = ["fancy-regex", "getrandom/wasm_js"]
+pcre2 = ["pcre2-sys"]
 rustls-tls = ["hf-hub?/rustls-tls"]
 
 [dev-dependencies]
