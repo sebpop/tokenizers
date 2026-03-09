@@ -377,7 +377,8 @@ impl NormalizedString {
         if !self.track_offsets {
             let n_range = range.into_full_range(self.len());
             if n_range.start == 0 && n_range.end == self.normalized.len() {
-                self.normalized = dest.into_iter().map(|(c, _)| c).collect();
+                self.normalized.clear();
+                self.normalized.extend(dest.into_iter().map(|(c, _)| c));
             } else {
                 let normalized: String = dest.into_iter().map(|(c, _)| c).collect();
                 let new_normalized = [
@@ -839,7 +840,7 @@ impl NormalizedString {
             let mut pool = cell.borrow_mut();
             let mut buf0 = pool.pop().unwrap_or_default();
             let mut buf1 = pool.pop().unwrap_or_default();
-            let mut out = Vec::new();
+            let mut out = Vec::with_capacity(splits.len());
             for (offsets, remove) in splits.into_iter() {
                 if !remove {
                     self.slice_into(Range::Normalized(offsets.0..offsets.1), &mut buf0)
