@@ -104,7 +104,7 @@ dary_heap = { version = "0.3.6", features = ["serde"] }
 compact_str = { version = "0.9", features = ["serde"] }
 
 [features]
-default = ["progressbar", "onig", "esaxx_fast", "mimalloc"]
+default = ["progressbar", "pcre2", "esaxx_fast", "mimalloc"]
 esaxx_fast = ["esaxx-rs/cpp"]
 progressbar = ["indicatif"]
 http = ["hf-hub"]
