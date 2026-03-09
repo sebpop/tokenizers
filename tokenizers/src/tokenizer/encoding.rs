@@ -101,6 +101,19 @@ impl Encoding {
         self.sequence_ranges.clear();
     }
 
+    /// Push a single token into the Encoding with placeholder values
+    /// for fields unused on the OffsetType::None fast path.
+    #[inline]
+    pub fn push_fast(&mut self, id: u32, type_id: u32) {
+        self.ids.push(id);
+        self.type_ids.push(type_id);
+        self.tokens.push(String::new());
+        self.words.push(None);
+        self.offsets.push((0, 0));
+        self.special_tokens_mask.push(0);
+        self.attention_mask.push(1);
+    }
+
     /// Return this Encoding to the shared pool for reuse.
     pub fn recycle(mut self) {
         self.clear();

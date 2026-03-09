@@ -1188,27 +1188,15 @@ where
         word_idx: Option<u32>,
         offsets_type: OffsetType,
     ) -> Result<Encoding> {
-        let mut pretokenized: PreTokenizedString = pretokenized.into();
-        match self.truncation.as_ref() {
-            Some(TruncationParams {
-                direction,
-                max_length,
-                strategy,
-                ..
-            }) if *strategy != TruncationStrategy::OnlySecond || type_id != 0 => pretokenized
-                .tokenize_with_limit(
-                    |normalized| self.model.tokenize(normalized.get()),
-                    *max_length,
-                    *direction,
-                )?,
-            _ => match offsets_type {
-                OffsetType::None => {
-                    self.model
-                        .tokenize_in_pretokenized_fast(&mut pretokenized)?
-                }
-                _ => self.model.tokenize_in_pretokenized(&mut pretokenized)?,
-            },
+        let pretokenized: PreTokenizedString = pretokenized.into();
+        if offsets_type == OffsetType::None {
+            return pretokenized.tokenize_and_encode_fast(
+                |normalized| self.model.tokenize_fast(normalized.get()),
+                type_id,
+            );
         }
+        let mut pretokenized = pretokenized;
+        self.model.tokenize_in_pretokenized(&mut pretokenized)?;
         pretokenized.into_encoding(word_idx, type_id, offsets_type)
     }
 }

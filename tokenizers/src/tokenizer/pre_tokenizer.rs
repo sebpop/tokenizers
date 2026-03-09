@@ -187,6 +187,33 @@ impl PreTokenizedString {
         Ok(())
     }
 
+    /// Fused tokenize + encode for OffsetType::None: tokenizes each split
+    /// and pushes token IDs directly into a pre-sized Encoding, avoiding
+    /// ~2000 intermediate Vec<Token> allocations per document and the
+    /// repeated Vec reallocation from flat_map().collect() with unknown size.
+    pub fn tokenize_and_encode_fast<F>(
+        self,
+        tokenize: F,
+        type_id: u32,
+    ) -> Result<Encoding>
+    where
+        F: Fn(&NormalizedString) -> Result<Vec<Token>>,
+    {
+        let mut encoding = Encoding::with_capacity(self.splits.len());
+        for split in self.splits {
+            if let Some(tokens) = split.tokens {
+                for token in tokens {
+                    encoding.push_fast(token.id, type_id);
+                }
+            } else {
+                for token in tokenize(&split.normalized)? {
+                    encoding.push_fast(token.id, type_id);
+                }
+            }
+        }
+        Ok(encoding)
+    }
+
     /// Transform the current `PreTokenizedString` into an `Encoding`.
     ///
     /// If a `word_idx` is provided, any word in the generated `Encoding`
