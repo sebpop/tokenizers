@@ -1,4 +1,5 @@
 use ahash::{AHashMap, AHashSet};
+use std::cell::RefCell;
 use std::sync::LazyLock;
 
 use crate::utils::SysRegex;
@@ -129,20 +130,28 @@ impl PreTokenizer for ByteLevel {
                 Ok(vec![normalized])
             }
         })?;
+        thread_local! {
+            static TRANSFORM_BUF: RefCell<Vec<(char, isize)>> = const { RefCell::new(Vec::new()) };
+        }
         pretokenized.normalize(|normalized| {
-            let s = normalized.get();
-            let mut transformations: Vec<(char, isize)> = Vec::with_capacity(s.len());
-            for (i, cur_char) in s.char_indices() {
-                let size = cur_char.len_utf8();
-                transformations.extend(
-                    s.as_bytes()[i..i + size]
-                        .iter()
-                        .enumerate()
-                        .map(|(i, b)| (BYTES_CHAR[b], isize::from(i > 0))),
-                );
-            }
-            normalized.transform(transformations, 0);
-            Ok(())
+            TRANSFORM_BUF.with(|cell| {
+                let mut buf = cell.borrow_mut();
+                buf.clear();
+                let s = normalized.get();
+                buf.reserve(s.len());
+                for (i, cur_char) in s.char_indices() {
+                    let size = cur_char.len_utf8();
+                    buf.extend(
+                        s.as_bytes()[i..i + size]
+                            .iter()
+                            .enumerate()
+                            .map(|(i, b)| (BYTES_CHAR[b], isize::from(i > 0))),
+                    );
+                }
+                // Drain into transform so the Vec retains its capacity for reuse.
+                normalized.transform(buf.drain(..), 0);
+                Ok(())
+            })
         })
     }
 }

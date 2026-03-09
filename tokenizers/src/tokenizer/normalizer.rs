@@ -376,14 +376,18 @@ impl NormalizedString {
     {
         if !self.track_offsets {
             let n_range = range.into_full_range(self.len());
-            let normalized: String = dest.into_iter().map(|(c, _)| c).collect();
-            let new_normalized = [
-                &self.normalized[..n_range.start],
-                normalized.as_str(),
-                &self.normalized[n_range.end..],
-            ]
-            .concat();
-            self.normalized = new_normalized;
+            if n_range.start == 0 && n_range.end == self.normalized.len() {
+                self.normalized = dest.into_iter().map(|(c, _)| c).collect();
+            } else {
+                let normalized: String = dest.into_iter().map(|(c, _)| c).collect();
+                let new_normalized = [
+                    &self.normalized[..n_range.start],
+                    normalized.as_str(),
+                    &self.normalized[n_range.end..],
+                ]
+                .concat();
+                self.normalized = new_normalized;
+            }
             return;
         }
 
