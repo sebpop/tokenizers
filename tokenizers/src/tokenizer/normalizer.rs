@@ -114,12 +114,16 @@ pub struct NormalizedString {
     /// The normalized version of the string, after all modifications.
     normalized: String,
     /// Mapping from normalized string to original one: (start, end) for each
-    /// byte of the normalized string
+    /// byte of the normalized string.
     alignments: Vec<(usize, usize)>,
     /// If this NormalizedString is a slice of a bigger one, we keep the track
     /// of the missing part, so that we can still give offsets from this original
     /// string.
     original_shift: usize,
+    /// When false, skip alignment computation and original string tracking.
+    /// This dramatically reduces the per-document working set on the
+    /// encode_fast path (OffsetType::None) where offsets are never used.
+    track_offsets: bool,
 }
 
 impl NormalizedString {
@@ -135,7 +139,12 @@ impl NormalizedString {
             normalized,
             alignments,
             original_shift,
+            track_offsets: true,
         }
+    }
+
+    pub fn tracks_offsets(&self) -> bool {
+        self.track_offsets
     }
     /// Return the normalized string
     pub fn get(&self) -> &str {
@@ -163,6 +172,9 @@ impl NormalizedString {
     where
         T: RangeBounds<usize> + Clone,
     {
+        if !self.track_offsets {
+            return None;
+        }
         let len_original = self.len_original();
         let len_normalized = self.len();
 
@@ -299,6 +311,17 @@ impl NormalizedString {
     where
         T: RangeBounds<usize> + Clone,
     {
+        if !self.track_offsets {
+            let normalized_range = range.into_full_range(self.len());
+            dest.normalized.clear();
+            dest.normalized
+                .push_str(self.normalized.get(normalized_range)?);
+            dest.original.clear();
+            dest.alignments.clear();
+            dest.track_offsets = false;
+            return Some(());
+        }
+
         let full_range = self.validate_range(range)?;
         let (normalized_range, original_range) = match full_range {
             Range::Original(_) => (
@@ -330,6 +353,7 @@ impl NormalizedString {
                 .map(|(start, end)| (start - n_shift, end - n_shift)),
         );
         dest.original_shift = self.original_shift + original_range.start;
+        dest.track_offsets = true;
 
         Some(())
     }
@@ -350,6 +374,19 @@ impl NormalizedString {
         T: RangeBounds<usize> + Clone,
         I: IntoIterator<Item = (char, isize)>,
     {
+        if !self.track_offsets {
+            let n_range = range.into_full_range(self.len());
+            let normalized: String = dest.into_iter().map(|(c, _)| c).collect();
+            let new_normalized = [
+                &self.normalized[..n_range.start],
+                normalized.as_str(),
+                &self.normalized[n_range.end..],
+            ]
+            .concat();
+            self.normalized = new_normalized;
+            return;
+        }
+
         let n_range = match range {
             Range::Normalized(_) => range.into_full_range(self.len()),
             Range::Original(_) => match self.convert_offsets(range) {
@@ -1026,6 +1063,21 @@ pub fn char_to_bytes(s: &str, range: std::ops::Range<usize>) -> Option<std::ops:
     Some(start?..end?)
 }
 
+impl NormalizedString {
+    /// Create a NormalizedString that skips alignment and original-string
+    /// tracking.  This avoids the 16-byte-per-input-byte alignments Vec
+    /// and the original String clone, reducing working set by ~18x.
+    pub fn from_str_fast(s: &str) -> Self {
+        Self {
+            original: String::new(),
+            normalized: s.to_owned(),
+            alignments: Vec::new(),
+            original_shift: 0,
+            track_offsets: false,
+        }
+    }
+}
+
 impl From<String> for NormalizedString {
     fn from(s: String) -> Self {
         let alignments = s
@@ -1042,6 +1094,7 @@ impl From<String> for NormalizedString {
             normalized,
             alignments,
             original_shift: 0,
+            track_offsets: true,
         }
     }
 }
@@ -1298,7 +1351,8 @@ mod tests {
                     (7, 8),
                     (8, 9)
                 ],
-                original_shift: 0
+                original_shift: 0,
+                track_offsets: true,
             }
         );
         assert_eq!(
@@ -1563,6 +1617,7 @@ mod tests {
                     (11, 12)
                 ],
                 original_shift: 0,
+                track_offsets: true,
             }
         );
 
@@ -1607,6 +1662,7 @@ mod tests {
                     (11, 12)
                 ],
                 original_shift: 0,
+                track_offsets: true,
             }
         );
 
@@ -1638,6 +1694,7 @@ mod tests {
                 normalized: "Hello_F".into(),
                 alignments: vec![(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7)],
                 original_shift: 0,
+                track_offsets: true,
             }
         );
         assert_eq!(
@@ -1682,6 +1739,7 @@ mod tests {
                     (11, 12)
                 ],
                 original_shift: 0,
+                track_offsets: true,
             }
         );
         assert_eq!(
@@ -1725,6 +1783,7 @@ mod tests {
                     (11, 12)
                 ],
                 original_shift: 0,
+                track_offsets: true,
             }
         );
         assert_eq!(
@@ -1768,6 +1827,7 @@ mod tests {
                     (11, 12)
                 ],
                 original_shift: 0,
+                track_offsets: true,
             }
         );
 
@@ -1819,6 +1879,7 @@ mod tests {
                     (11, 12)
                 ],
                 original_shift: 0,
+                track_offsets: true,
             }
         );
         assert_eq!(
@@ -1864,6 +1925,7 @@ mod tests {
                     (11, 12)
                 ],
                 original_shift: 0,
+                track_offsets: true,
             }
         );
         assert_eq!(
@@ -1909,6 +1971,7 @@ mod tests {
                     (12, 16)
                 ],
                 original_shift: 0,
+                track_offsets: true,
             }
         );
         assert_eq!(
@@ -1963,6 +2026,7 @@ mod tests {
                     (12, 16)
                 ],
                 original_shift: 0,
+                track_offsets: true,
             }
         );
         assert_eq!(
@@ -2012,6 +2076,7 @@ mod tests {
                     (12, 16)
                 ],
                 original_shift: 0,
+                track_offsets: true,
             }
         );
 
@@ -2043,6 +2108,7 @@ mod tests {
                     (12, 16)
                 ],
                 original_shift: 0,
+                track_offsets: true,
             }
         );
         assert_eq!(
@@ -2105,6 +2171,7 @@ mod tests {
                     (12, 16)
                 ],
                 original_shift: 0,
+                track_offsets: true,
             }
         );
         assert_eq!(
@@ -2167,6 +2234,7 @@ mod tests {
                     (12, 16)
                 ],
                 original_shift: 0,
+                track_offsets: true,
             }
         );
         assert_eq!(
@@ -2235,6 +2303,7 @@ mod tests {
                     (12, 16)
                 ],
                 original_shift: 0,
+                track_offsets: true,
             }
         );
         assert_eq!(
@@ -2287,6 +2356,7 @@ mod tests {
                     (12, 16)
                 ],
                 original_shift: 0,
+                track_offsets: true,
             }
         );
         assert_eq!(

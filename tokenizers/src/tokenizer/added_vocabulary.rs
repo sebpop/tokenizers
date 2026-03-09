@@ -463,7 +463,33 @@ impl AddedVocabulary {
         normalizer: Option<&N>,
         sequence: &str,
     ) -> PreTokenizedString {
-        let mut pretokenized: PreTokenizedString = sequence.into();
+        self.extract_and_normalize_inner(normalizer, sequence, true)
+    }
+
+    /// Like `extract_and_normalize`, but when `track_offsets` is false,
+    /// skips alignment computation and original-string tracking to reduce
+    /// the per-document working set on the encode_fast path.
+    pub fn extract_and_normalize_with_offsets<N: Normalizer>(
+        &self,
+        normalizer: Option<&N>,
+        sequence: &str,
+        track_offsets: bool,
+    ) -> PreTokenizedString {
+        self.extract_and_normalize_inner(normalizer, sequence, track_offsets)
+    }
+
+    fn extract_and_normalize_inner<N: Normalizer>(
+        &self,
+        normalizer: Option<&N>,
+        sequence: &str,
+        track_offsets: bool,
+    ) -> PreTokenizedString {
+        let normalized = if track_offsets {
+            NormalizedString::from(sequence.to_owned())
+        } else {
+            NormalizedString::from_str_fast(sequence)
+        };
+        let mut pretokenized: PreTokenizedString = normalized.into();
 
         // 1. We extract all the non-normalized tokens from the non-normalized string
         pretokenized

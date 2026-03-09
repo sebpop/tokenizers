@@ -301,8 +301,13 @@ impl PreTokenizedString {
 
 impl From<NormalizedString> for PreTokenizedString {
     fn from(s: NormalizedString) -> Self {
+        let original = if s.tracks_offsets() {
+            s.get_original().to_owned()
+        } else {
+            String::new()
+        };
         Self {
-            original: s.get_original().to_owned(),
+            original,
             splits: vec![Split {
                 normalized: s,
                 tokens: None,
