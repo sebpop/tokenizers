@@ -107,23 +107,28 @@ impl std::fmt::Display for SplitDelimiterBehavior {
 /// It is possible to retrieve a part of the original string, by indexing it with
 /// offsets from the normalized one, and the other way around too. It is also
 /// possible to convert offsets from one referential to the other one easily.
+/// Offset-tracking data, boxed to keep NormalizedString compact (32 bytes)
+/// on the encode_fast path where offsets are not needed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OffsetData {
+    original: String,
+    alignments: Vec<(usize, usize)>,
+    original_shift: usize,
+}
+
+/// A `NormalizedString` takes care of processing an "original" string to modify
+/// it and obtain a "normalized" string.
+///
+/// When `offsets` is `Some`, it keeps the original string, alignment data, and
+/// offset shift for converting between original and normalized byte ranges.
+/// When `offsets` is `None` (encode_fast path), the struct is only 32 bytes:
+/// just `normalized` (24 bytes) + `offsets` pointer (8 bytes, null).
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub struct NormalizedString {
-    /// The original version of the string, before any modification.
-    original: String,
     /// The normalized version of the string, after all modifications.
     normalized: String,
-    /// Mapping from normalized string to original one: (start, end) for each
-    /// byte of the normalized string.
-    alignments: Vec<(usize, usize)>,
-    /// If this NormalizedString is a slice of a bigger one, we keep the track
-    /// of the missing part, so that we can still give offsets from this original
-    /// string.
-    original_shift: usize,
-    /// When false, skip alignment computation and original string tracking.
-    /// This dramatically reduces the per-document working set on the
-    /// encode_fast path (OffsetType::None) where offsets are never used.
-    track_offsets: bool,
+    /// Offset tracking data. None on the fast path (32-byte struct).
+    offsets: Option<Box<OffsetData>>,
 }
 
 impl NormalizedString {
@@ -135,33 +140,46 @@ impl NormalizedString {
         original_shift: usize,
     ) -> Self {
         Self {
-            original,
             normalized,
-            alignments,
-            original_shift,
-            track_offsets: true,
+            offsets: Some(Box::new(OffsetData {
+                original,
+                alignments,
+                original_shift,
+            })),
         }
     }
 
     pub fn tracks_offsets(&self) -> bool {
-        self.track_offsets
+        self.offsets.is_some()
     }
-    /// Return the normalized string
+
+    fn od(&self) -> &OffsetData {
+        self.offsets.as_ref().expect("offset data accessed on fast path")
+    }
+
+    fn od_mut(&mut self) -> &mut OffsetData {
+        self.offsets.as_mut().expect("offset data accessed on fast path")
+    }
+
+    /// Return the normalized string.
     pub fn get(&self) -> &str {
         &self.normalized
     }
 
-    /// Return the original string
+    /// Return the original string.
     pub fn get_original(&self) -> &str {
-        &self.original
+        match &self.offsets {
+            Some(od) => &od.original,
+            None => "",
+        }
     }
 
-    /// Return the original offsets
+    /// Return the original offsets.
     pub fn offsets_original(&self) -> Offsets {
-        (
-            self.original_shift,
-            self.original_shift + self.len_original(),
-        )
+        match &self.offsets {
+            Some(od) => (od.original_shift, od.original_shift + self.len_original()),
+            None => (0, 0),
+        }
     }
 
     /// Convert the given offsets range from one referential to the other one:
@@ -172,10 +190,8 @@ impl NormalizedString {
     where
         T: RangeBounds<usize> + Clone,
     {
-        if !self.track_offsets {
-            return None;
-        }
-        let len_original = self.len_original();
+        let od = self.offsets.as_ref()?;
+        let len_original = od.original.len();
         let len_normalized = self.len();
 
         let (target, original) = match range {
@@ -193,7 +209,7 @@ impl NormalizedString {
         }
 
         // If we target 0..0 on an empty string, we want to expand to the entire equivalent
-        if original && self.original.is_empty() && target == (0..0) {
+        if original && self.od().original.is_empty() && target == (0..0) {
             return Some(0..len_normalized);
         }
         if !original && self.normalized.is_empty() && target == (0..0) {
@@ -202,7 +218,7 @@ impl NormalizedString {
 
         if original {
             let (mut start, mut end) = (None, None);
-            self.alignments
+            self.od().alignments
                 .iter()
                 .enumerate()
                 .take_while(|(_, alignment)| target.end >= alignment.1)
@@ -228,7 +244,7 @@ impl NormalizedString {
                 _ => None,
             }
         } else {
-            self.alignments.get(target).and_then(expand_alignments)
+            self.od().alignments.get(target).and_then(expand_alignments)
         }
     }
 
@@ -250,9 +266,10 @@ impl NormalizedString {
     {
         match range {
             Range::Original(_) => self
+                .od()
                 .original
                 .get(range.into_full_range(self.len_original())),
-            Range::Normalized(_) => self.original.get(self.convert_offsets(range)?),
+            Range::Normalized(_) => self.od().original.get(self.convert_offsets(range)?),
         }
     }
 
@@ -263,9 +280,9 @@ impl NormalizedString {
     ) -> Option<Range<std::ops::Range<usize>>> {
         match range {
             Range::Original(_) => {
-                let r = range.into_full_range(self.original.len());
-                if !(self.original.is_char_boundary(r.start)
-                    && self.original.is_char_boundary(r.end))
+                let r = range.into_full_range(self.od().original.len());
+                if !(self.od().original.is_char_boundary(r.start)
+                    && self.od().original.is_char_boundary(r.end))
                 {
                     None
                 } else {
@@ -311,14 +328,12 @@ impl NormalizedString {
     where
         T: RangeBounds<usize> + Clone,
     {
-        if !self.track_offsets {
+        if self.offsets.is_none() {
             let normalized_range = range.into_full_range(self.len());
             dest.normalized.clear();
             dest.normalized
                 .push_str(self.normalized.get(normalized_range)?);
-            dest.original.clear();
-            dest.alignments.clear();
-            dest.track_offsets = false;
+            dest.offsets = None;
             return Some(());
         }
 
@@ -335,25 +350,33 @@ impl NormalizedString {
         };
 
         let n_shift = original_range.start;
+        let src_od = self.od();
 
-        // Reserve so clear + push_str/extend don't reallocate (reduces _mi_page_malloc in hot path).
-        dest.original.reserve(original_range.len());
+        let od = dest.offsets.get_or_insert_with(|| {
+            Box::new(OffsetData {
+                original: String::new(),
+                alignments: Vec::new(),
+                original_shift: 0,
+            })
+        });
+
+        od.original.reserve(original_range.len());
         dest.normalized.reserve(normalized_range.len());
-        dest.alignments.reserve(normalized_range.len());
+        od.alignments.reserve(normalized_range.len());
 
-        dest.original.clear();
-        dest.original.push_str(&self.original[original_range.clone()]);
+        od.original.clear();
+        od.original.push_str(&src_od.original[original_range.clone()]);
         dest.normalized.clear();
         dest.normalized.push_str(&self.normalized[normalized_range.clone()]);
-        dest.alignments.clear();
-        dest.alignments.extend(
-            self.alignments
+        od.alignments.clear();
+        od.alignments.extend(
+            src_od
+                .alignments
                 .get(normalized_range)?
                 .iter()
                 .map(|(start, end)| (start - n_shift, end - n_shift)),
         );
-        dest.original_shift = self.original_shift + original_range.start;
-        dest.track_offsets = true;
+        od.original_shift = src_od.original_shift + original_range.start;
 
         Some(())
     }
@@ -374,7 +397,7 @@ impl NormalizedString {
         T: RangeBounds<usize> + Clone,
         I: IntoIterator<Item = (char, isize)>,
     {
-        if !self.track_offsets {
+        if self.offsets.is_none() {
             let n_range = range.into_full_range(self.len());
             if n_range.start == 0 && n_range.end == self.normalized.len() {
                 self.normalized.clear();
@@ -440,10 +463,10 @@ impl NormalizedString {
                     } else {
                         // This is a newly inserted character, so it shares the same alignment
                         // than the previous one
-                        self.alignments[idx - 1]
+                        self.od().alignments[idx - 1]
                     }
                 } else {
-                    self.alignments[idx]
+                    self.od().alignments[idx]
                 };
 
                 // If we are replacing a character, find it and compute the change in size
@@ -484,7 +507,7 @@ impl NormalizedString {
             })
             .collect::<String>();
 
-        self.alignments.splice(n_range.clone(), alignments);
+        self.od_mut().alignments.splice(n_range.clone(), alignments);
 
         assert!(self.normalized.get(n_range.clone()).is_some());
         let new_normalized = [
@@ -638,7 +661,7 @@ impl NormalizedString {
     /// Replace anything that matches the pattern with the given content.
     pub fn replace<P: Pattern>(&mut self, pattern: P, content: &str) -> Result<()> {
         let mut new_normalized = String::with_capacity(self.normalized.len()); // Initially allocate for the input size
-        let mut new_alignments: Vec<(usize, usize)> = Vec::with_capacity(self.alignments.len());
+        let mut new_alignments: Vec<(usize, usize)> = Vec::with_capacity(self.od().alignments.len());
         let mut last_end = 0; // Keep track of the last end position
 
         pattern
@@ -663,7 +686,7 @@ impl NormalizedString {
 
                     // Copy the part of the string that is before the match
                     new_normalized.push_str(&self.normalized[last_end..start]);
-                    new_alignments.extend(self.alignments[last_end..start].iter().cloned());
+                    new_alignments.extend(self.od().alignments[last_end..start].iter().cloned());
 
                     let n_range = Range::Normalized(range).into_full_range(self.len());
 
@@ -693,10 +716,10 @@ impl NormalizedString {
                                 } else {
                                     // This is a newly inserted character, so it shares the same alignment
                                     // than the previous one
-                                    self.alignments[idx - 1]
+                                    self.od().alignments[idx - 1]
                                 }
                             } else {
-                                self.alignments[idx]
+                                self.od().alignments[idx]
                             };
 
                             // If we are replacing a character, find it and compute the change in size
@@ -735,10 +758,10 @@ impl NormalizedString {
 
         // Copy the remaining part of the input.
         new_normalized.push_str(&self.normalized[last_end..]);
-        new_alignments.extend(&self.alignments[last_end..]);
+        new_alignments.extend(&self.od().alignments[last_end..]);
 
         self.normalized = new_normalized;
-        self.alignments = new_alignments;
+        self.od_mut().alignments = new_alignments;
         Ok(())
     }
 
@@ -835,21 +858,22 @@ impl NormalizedString {
             }
         };
 
-        // Then we split according to the computed splits, reusing two buffers to avoid per-slice malloc.
+        // Split using pooled buffers: after warmup, every pop returns a
+        // pre-allocated NormalizedString (recycled by tokenize_and_encode_fast),
+        // so slice_into reuses existing String capacity without malloc.
         let result = SLICE_POOL.with(|cell| {
             let mut pool = cell.borrow_mut();
-            let mut buf0 = pool.pop().unwrap_or_default();
-            let mut buf1 = pool.pop().unwrap_or_default();
+            let mut buf = pool.pop().unwrap_or_default();
             let mut out = Vec::with_capacity(splits.len());
             for (offsets, remove) in splits.into_iter() {
                 if !remove {
-                    self.slice_into(Range::Normalized(offsets.0..offsets.1), &mut buf0)
+                    self.slice_into(Range::Normalized(offsets.0..offsets.1), &mut buf)
                         .expect("NormalizedString bad split");
-                    out.push(std::mem::replace(&mut buf0, std::mem::take(&mut buf1)));
+                    let next = pool.pop().unwrap_or_default();
+                    out.push(std::mem::replace(&mut buf, next));
                 }
             }
-            pool.push(buf0);
-            pool.push(buf1);
+            pool.push(buf);
             out
         });
         Ok(result)
@@ -914,7 +938,7 @@ impl NormalizedString {
 
     /// Returns the length of the original string (counting chars not bytes)
     pub fn len_original(&self) -> usize {
-        self.original.len()
+        self.od().original.len()
     }
 
     /// Whether empty
@@ -927,18 +951,18 @@ impl NormalizedString {
     pub(crate) fn alignments_original(&self) -> Vec<(usize, usize)> {
         // Start, end are in alignments
         // offset, length are in alignments_original
-        let mut alignments_original = Vec::with_capacity(self.original.len());
+        let mut alignments_original = Vec::with_capacity(self.od().original.len());
 
         // Eventual gap before first group
-        let start = self.alignments[0].0;
+        let start = self.od().alignments[0].0;
         if start != 0 {
             alignments_original.extend(vec![(0, 0); start]);
         }
 
-        let mut last = (&self.alignments[0].0, &self.alignments[0].1);
+        let mut last = (&self.od().alignments[0].0, &self.od().alignments[0].1);
         let mut offset = 0;
         let mut length = 0;
-        for (start, end) in &self.alignments {
+        for (start, end) in &self.od().alignments {
             if last == (start, end) {
                 // This is the same group
                 length += 1;
@@ -966,10 +990,10 @@ impl NormalizedString {
         offset += length;
         alignments_original.extend(vec![
             (offset, offset);
-            self.original.len() - alignments_original.len()
+            self.od().original.len() - alignments_original.len()
         ]);
 
-        // assert_eq!(alignments_original.len(), self.original.len());
+        // assert_eq!(alignments_original.len(), self.od().original.len());
         alignments_original
     }
 }
@@ -1074,11 +1098,8 @@ impl NormalizedString {
     /// and the original String clone, reducing working set by ~18x.
     pub fn from_str_fast(s: &str) -> Self {
         Self {
-            original: String::new(),
             normalized: s.to_owned(),
-            alignments: Vec::new(),
-            original_shift: 0,
-            track_offsets: false,
+            offsets: None,
         }
     }
 }
@@ -1095,11 +1116,12 @@ impl From<String> for NormalizedString {
         let original = s.clone();
         let normalized = s;
         Self {
-            original,
             normalized,
-            alignments,
-            original_shift: 0,
-            track_offsets: true,
+            offsets: Some(Box::new(OffsetData {
+                original,
+                alignments,
+                original_shift: 0,
+            })),
         }
     }
 }
@@ -1135,7 +1157,7 @@ mod tests {
         let mut n = NormalizedString::from("élégant");
         n.nfd();
         assert_eq!(
-            &n.alignments,
+            &n.offsets.as_ref().unwrap().alignments,
             &[
                 (0, 2),
                 (0, 2),
@@ -1174,7 +1196,7 @@ mod tests {
         assert_eq!(n.get(), "elegant");
 
         assert_eq!(
-            &n.alignments,
+            &n.offsets.as_ref().unwrap().alignments,
             &[(0, 2), (2, 3), (3, 5), (5, 6), (6, 7), (7, 8), (8, 9)]
         );
         assert_eq!(
@@ -1199,7 +1221,7 @@ mod tests {
         n.filter(|c| c != 'n');
         assert_eq!(n.get(), "élégat");
         assert_eq!(
-            &n.alignments,
+            &n.offsets.as_ref().unwrap().alignments,
             &[
                 (0, 2),
                 (0, 2),
@@ -1234,7 +1256,7 @@ mod tests {
         n.nfd().filter(|c| !c.is_mark_nonspacing() && c != 'n');
         assert_eq!(n.get(), "elegat");
         assert_eq!(
-            &n.alignments,
+            &n.offsets.as_ref().unwrap().alignments,
             &[(0, 2), (2, 3), (3, 5), (5, 6), (6, 7), (8, 9)]
         );
         assert_eq!(
@@ -1338,10 +1360,7 @@ mod tests {
 
         assert_eq!(
             n,
-            NormalizedString {
-                original: "野口 No".into(),
-                normalized: " 野  口  No".into(),
-                alignments: vec![
+            NormalizedString { normalized: " 野  口  No".into(), offsets: Some(Box::new(OffsetData { original: "野口 No".into(), alignments: vec![
                     (0, 3),
                     (0, 3),
                     (0, 3),
@@ -1355,10 +1374,7 @@ mod tests {
                     (6, 7),
                     (7, 8),
                     (8, 9)
-                ],
-                original_shift: 0,
-                track_offsets: true,
-            }
+                ], original_shift: 0 })) }
         );
         assert_eq!(
             n.alignments_original(),
@@ -1467,7 +1483,7 @@ mod tests {
         n.prepend("Hey ");
         assert_eq!(&n.normalized, "Hey there");
         assert_eq!(
-            n.alignments,
+            n.offsets.as_ref().unwrap().alignments,
             vec![
                 (0, 1),
                 (0, 1),
@@ -1489,7 +1505,7 @@ mod tests {
         n.append(" there");
         assert_eq!(&n.normalized, "Hey there");
         assert_eq!(
-            n.alignments,
+            n.offsets.as_ref().unwrap().alignments,
             vec![
                 (0, 1),
                 (1, 2),
@@ -1607,10 +1623,7 @@ mod tests {
         current.transform_range(Range::Original(0..4), vec![('Y', 0)], 3);
         assert_eq!(
             current,
-            NormalizedString {
-                original: "Hello friend".into(),
-                normalized: "Yo friend".into(),
-                alignments: vec![
+            NormalizedString { normalized: "Yo friend".into(), offsets: Some(Box::new(OffsetData { original: "Hello friend".into(), alignments: vec![
                     (3, 4),
                     (4, 5),
                     (5, 6),
@@ -1620,10 +1633,7 @@ mod tests {
                     (9, 10),
                     (10, 11),
                     (11, 12)
-                ],
-                original_shift: 0,
-                track_offsets: true,
-            }
+                ], original_shift: 0 })) }
         );
 
         assert_eq!(
@@ -1653,10 +1663,7 @@ mod tests {
         );
         assert_eq!(
             current,
-            NormalizedString {
-                original: "Hello friend".into(),
-                normalized: "Hel_FRnd".into(),
-                alignments: vec![
+            NormalizedString { normalized: "Hel_FRnd".into(), offsets: Some(Box::new(OffsetData { original: "Hello friend".into(), alignments: vec![
                     (0, 1),
                     (1, 2),
                     (2, 3),
@@ -1665,10 +1672,7 @@ mod tests {
                     (7, 8),
                     (10, 11),
                     (11, 12)
-                ],
-                original_shift: 0,
-                track_offsets: true,
-            }
+                ], original_shift: 0 })) }
         );
 
         assert_eq!(
@@ -1694,13 +1698,7 @@ mod tests {
         current.transform_range(Range::Original(5..), vec![('_', 0), ('F', -5)], 0);
         assert_eq!(
             current,
-            NormalizedString {
-                original: "Hello friend".into(),
-                normalized: "Hello_F".into(),
-                alignments: vec![(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7)],
-                original_shift: 0,
-                track_offsets: true,
-            }
+            NormalizedString { normalized: "Hello_F".into(), offsets: Some(Box::new(OffsetData { original: "Hello friend".into(), alignments: vec![(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7)], original_shift: 0 })) }
         );
         assert_eq!(
             current.alignments_original(),
@@ -1725,10 +1723,7 @@ mod tests {
         current.transform_range(Range::Original(0..1), vec![('H', 1), ('H', 0)], 0);
         assert_eq!(
             current,
-            NormalizedString {
-                original: "Hello friend".into(),
-                normalized: "HHello friend".into(),
-                alignments: vec![
+            NormalizedString { normalized: "HHello friend".into(), offsets: Some(Box::new(OffsetData { original: "Hello friend".into(), alignments: vec![
                     (0, 0),
                     (0, 1),
                     (1, 2),
@@ -1742,10 +1737,7 @@ mod tests {
                     (9, 10),
                     (10, 11),
                     (11, 12)
-                ],
-                original_shift: 0,
-                track_offsets: true,
-            }
+                ], original_shift: 0 })) }
         );
         assert_eq!(
             current.alignments_original(),
@@ -1769,10 +1761,7 @@ mod tests {
         current.transform_range(Range::Original(0..0), vec![('H', 1)], 0);
         assert_eq!(
             current,
-            NormalizedString {
-                original: "Hello friend".into(),
-                normalized: "HHello friend".into(),
-                alignments: vec![
+            NormalizedString { normalized: "HHello friend".into(), offsets: Some(Box::new(OffsetData { original: "Hello friend".into(), alignments: vec![
                     (0, 0),
                     (0, 1),
                     (1, 2),
@@ -1786,10 +1775,7 @@ mod tests {
                     (9, 10),
                     (10, 11),
                     (11, 12)
-                ],
-                original_shift: 0,
-                track_offsets: true,
-            }
+                ], original_shift: 0 })) }
         );
         assert_eq!(
             current.alignments_original(),
@@ -1813,10 +1799,7 @@ mod tests {
         current.transform_range(Range::Original(0..1), vec![('H', 0), ('H', 1)], 0);
         assert_eq!(
             current,
-            NormalizedString {
-                original: "Hello friend".into(),
-                normalized: "HHello friend".into(),
-                alignments: vec![
+            NormalizedString { normalized: "HHello friend".into(), offsets: Some(Box::new(OffsetData { original: "Hello friend".into(), alignments: vec![
                     (0, 1),
                     (0, 1),
                     (1, 2),
@@ -1830,10 +1813,7 @@ mod tests {
                     (9, 10),
                     (10, 11),
                     (11, 12)
-                ],
-                original_shift: 0,
-                track_offsets: true,
-            }
+                ], original_shift: 0 })) }
         );
 
         assert_eq!(
@@ -1863,10 +1843,7 @@ mod tests {
         );
         assert_eq!(
             current,
-            NormalizedString {
-                original: "Hello friend".into(),
-                normalized: "Hello_my_friend".into(),
-                alignments: vec![
+            NormalizedString { normalized: "Hello_my_friend".into(), offsets: Some(Box::new(OffsetData { original: "Hello friend".into(), alignments: vec![
                     (0, 1),
                     (1, 2),
                     (2, 3),
@@ -1882,10 +1859,7 @@ mod tests {
                     (9, 10),
                     (10, 11),
                     (11, 12)
-                ],
-                original_shift: 0,
-                track_offsets: true,
-            }
+                ], original_shift: 0 })) }
         );
         assert_eq!(
             current.alignments_original(),
@@ -1910,10 +1884,7 @@ mod tests {
         current.transform_range(Range::Original(11..), vec![('d', 0), ('_', 1), ('!', 1)], 0);
         assert_eq!(
             current,
-            NormalizedString {
-                original: "Hello friend".into(),
-                normalized: "Hello friend_!".into(),
-                alignments: vec![
+            NormalizedString { normalized: "Hello friend_!".into(), offsets: Some(Box::new(OffsetData { original: "Hello friend".into(), alignments: vec![
                     (0, 1),
                     (1, 2),
                     (2, 3),
@@ -1928,10 +1899,7 @@ mod tests {
                     (11, 12),
                     (11, 12),
                     (11, 12)
-                ],
-                original_shift: 0,
-                track_offsets: true,
-            }
+                ], original_shift: 0 })) }
         );
         assert_eq!(
             current.alignments_original(),
@@ -1961,10 +1929,7 @@ mod tests {
         current.transform_range(Range::Original(0..8), vec![('G', -1)], 0);
         assert_eq!(
             current,
-            NormalizedString {
-                original: "𝔾𝕠𝕠𝕕".into(),
-                normalized: "G𝕠𝕕".into(),
-                alignments: vec![
+            NormalizedString { normalized: "G𝕠𝕕".into(), offsets: Some(Box::new(OffsetData { original: "𝔾𝕠𝕠𝕕".into(), alignments: vec![
                     (0, 4),
                     (8, 12),
                     (8, 12),
@@ -1974,10 +1939,7 @@ mod tests {
                     (12, 16),
                     (12, 16),
                     (12, 16)
-                ],
-                original_shift: 0,
-                track_offsets: true,
-            }
+                ], original_shift: 0 })) }
         );
         assert_eq!(
             current.alignments_original(),
@@ -2016,10 +1978,7 @@ mod tests {
         current.transform_range(Range::Original(4..12), vec![('o', -1)], 0);
         assert_eq!(
             current,
-            NormalizedString {
-                original: "𝔾𝕠𝕠𝕕".into(),
-                normalized: "𝔾o𝕕".into(),
-                alignments: vec![
+            NormalizedString { normalized: "𝔾o𝕕".into(), offsets: Some(Box::new(OffsetData { original: "𝔾𝕠𝕠𝕕".into(), alignments: vec![
                     (0, 4),
                     (0, 4),
                     (0, 4),
@@ -2029,10 +1988,7 @@ mod tests {
                     (12, 16),
                     (12, 16),
                     (12, 16)
-                ],
-                original_shift: 0,
-                track_offsets: true,
-            }
+                ], original_shift: 0 })) }
         );
         assert_eq!(
             current.alignments_original(),
@@ -2061,10 +2017,7 @@ mod tests {
         current.transform_range(Range::Original(12..), vec![('d', 0), ('!', 1)], 0);
         assert_eq!(
             current,
-            NormalizedString {
-                original: "𝔾𝕠𝕠𝕕".into(),
-                normalized: "𝔾𝕠𝕠d!".into(),
-                alignments: vec![
+            NormalizedString { normalized: "𝔾𝕠𝕠d!".into(), offsets: Some(Box::new(OffsetData { original: "𝔾𝕠𝕠𝕕".into(), alignments: vec![
                     (0, 4),
                     (0, 4),
                     (0, 4),
@@ -2079,10 +2032,7 @@ mod tests {
                     (8, 12),
                     (12, 16),
                     (12, 16)
-                ],
-                original_shift: 0,
-                track_offsets: true,
-            }
+                ], original_shift: 0 })) }
         );
 
         // Adding at the beginning
@@ -2090,10 +2040,7 @@ mod tests {
         current.transform_range(Range::Original(0..4), vec![('_', 1), ('𝔾', 0)], 0);
         assert_eq!(
             current,
-            NormalizedString {
-                original: "𝔾𝕠𝕠𝕕".into(),
-                normalized: "_𝔾𝕠𝕠𝕕".into(),
-                alignments: vec![
+            NormalizedString { normalized: "_𝔾𝕠𝕠𝕕".into(), offsets: Some(Box::new(OffsetData { original: "𝔾𝕠𝕠𝕕".into(), alignments: vec![
                     (0, 0),
                     (0, 4),
                     (0, 4),
@@ -2111,10 +2058,7 @@ mod tests {
                     (12, 16),
                     (12, 16),
                     (12, 16)
-                ],
-                original_shift: 0,
-                track_offsets: true,
-            }
+                ], original_shift: 0 })) }
         );
         assert_eq!(
             current.alignments_original(),
@@ -2153,10 +2097,7 @@ mod tests {
         current.transform_range(Range::Original(0..0), vec![('_', 1)], 0);
         assert_eq!(
             current,
-            NormalizedString {
-                original: "𝔾𝕠𝕠𝕕".into(),
-                normalized: "_𝔾𝕠𝕠𝕕".into(),
-                alignments: vec![
+            NormalizedString { normalized: "_𝔾𝕠𝕠𝕕".into(), offsets: Some(Box::new(OffsetData { original: "𝔾𝕠𝕠𝕕".into(), alignments: vec![
                     (0, 0),
                     (0, 4),
                     (0, 4),
@@ -2174,10 +2115,7 @@ mod tests {
                     (12, 16),
                     (12, 16),
                     (12, 16)
-                ],
-                original_shift: 0,
-                track_offsets: true,
-            }
+                ], original_shift: 0 })) }
         );
         assert_eq!(
             current.alignments_original(),
@@ -2216,10 +2154,7 @@ mod tests {
         current.transform_range(Range::Original(0..4), vec![('𝔾', 0), ('o', 1)], 0);
         assert_eq!(
             current,
-            NormalizedString {
-                original: "𝔾𝕠𝕠𝕕".into(),
-                normalized: "𝔾o𝕠𝕠𝕕".into(),
-                alignments: vec![
+            NormalizedString { normalized: "𝔾o𝕠𝕠𝕕".into(), offsets: Some(Box::new(OffsetData { original: "𝔾𝕠𝕠𝕕".into(), alignments: vec![
                     (0, 4),
                     (0, 4),
                     (0, 4),
@@ -2237,10 +2172,7 @@ mod tests {
                     (12, 16),
                     (12, 16),
                     (12, 16)
-                ],
-                original_shift: 0,
-                track_offsets: true,
-            }
+                ], original_shift: 0 })) }
         );
         assert_eq!(
             current.alignments_original(),
@@ -2283,10 +2215,7 @@ mod tests {
         );
         assert_eq!(
             current,
-            NormalizedString {
-                original: "𝔾𝕠𝕠𝕕".into(),
-                normalized: "𝔾𝕠ooo𝕠𝕕".into(),
-                alignments: vec![
+            NormalizedString { normalized: "𝔾𝕠ooo𝕠𝕕".into(), offsets: Some(Box::new(OffsetData { original: "𝔾𝕠𝕠𝕕".into(), alignments: vec![
                     (0, 4),
                     (0, 4),
                     (0, 4),
@@ -2306,10 +2235,7 @@ mod tests {
                     (12, 16),
                     (12, 16),
                     (12, 16)
-                ],
-                original_shift: 0,
-                track_offsets: true,
-            }
+                ], original_shift: 0 })) }
         );
         assert_eq!(
             current.alignments_original(),
@@ -2338,10 +2264,7 @@ mod tests {
         current.transform_range(Range::Original(16..), vec![('!', 1)], 0);
         assert_eq!(
             current,
-            NormalizedString {
-                original: "𝔾𝕠𝕠𝕕".into(),
-                normalized: "𝔾𝕠𝕠𝕕!".into(),
-                alignments: vec![
+            NormalizedString { normalized: "𝔾𝕠𝕠𝕕!".into(), offsets: Some(Box::new(OffsetData { original: "𝔾𝕠𝕠𝕕".into(), alignments: vec![
                     (0, 4),
                     (0, 4),
                     (0, 4),
@@ -2359,10 +2282,7 @@ mod tests {
                     (12, 16),
                     (12, 16),
                     (12, 16)
-                ],
-                original_shift: 0,
-                track_offsets: true,
-            }
+                ], original_shift: 0 })) }
         );
         assert_eq!(
             current.alignments_original(),
