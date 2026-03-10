@@ -65,6 +65,13 @@ pub trait Normalizer {
 /// the original string.
 pub trait PreTokenizer {
     fn pre_tokenize(&self, pretokenized: &mut PreTokenizedString) -> Result<()>;
+
+    /// If this pre-tokenizer supports the fused encode_ids_fast path
+    /// (regex + byte-level encode + tokenize in a single pass), return
+    /// a reference to the ByteLevel instance.  Default returns None.
+    fn as_byte_level(&self) -> Option<&crate::pre_tokenizers::byte_level::ByteLevel> {
+        None
+    }
 }
 
 /// Represents a model used during Tokenization (like BPE or Word or Unigram).
@@ -765,6 +772,23 @@ where
         type_id: u32,
         offsets_type: OffsetType,
     ) -> Result<Encoding> {
+        // Fast path: ByteLevel pre-tokenizer + OffsetType::None + raw input.
+        // Bypasses the entire NormalizedString/Split pipeline, running regex +
+        // byte-level encode + BPE in a single fused pass with one contiguous buffer.
+        if offsets_type == OffsetType::None {
+            if let InputSequence::Raw(ref seq) = sequence {
+                if let Some(ref pt) = self.pre_tokenizer {
+                    if let Some(bl) = pt.as_byte_level() {
+                        return bl.encode_ids_fast(
+                            seq.as_ref(),
+                            |segment| self.model.tokenize_ids(segment),
+                            type_id,
+                        );
+                    }
+                }
+            }
+        }
+
         let track_offsets = offsets_type != OffsetType::None;
         let encode = |is_pre_tokenized, subseq_idx, subseq| -> Result<Encoding> {
             let normalized = self

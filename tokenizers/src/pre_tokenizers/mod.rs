@@ -59,6 +59,13 @@ impl PreTokenizer for PreTokenizerWrapper {
             Self::FixedLength(fl) => fl.pre_tokenize(normalized),
         }
     }
+
+    fn as_byte_level(&self) -> Option<&crate::pre_tokenizers::byte_level::ByteLevel> {
+        match self {
+            Self::ByteLevel(bl) => Some(bl),
+            _ => None,
+        }
+    }
 }
 
 impl<'de> Deserialize<'de> for PreTokenizerWrapper {

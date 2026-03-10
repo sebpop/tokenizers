@@ -6,7 +6,7 @@ use crate::utils::SysRegex;
 use serde::{Deserialize, Serialize};
 
 use crate::tokenizer::{
-    Decoder, Encoding, PostProcessor, PreTokenizedString, PreTokenizer, Result,
+    Decoder, Encoding, NormalizedString, PostProcessor, PreTokenizedString, PreTokenizer, Result,
     SplitDelimiterBehavior,
 };
 use crate::utils::macro_rules_attribute;
@@ -46,6 +46,15 @@ static RE: LazyLock<SysRegex> = LazyLock::new(|| {
         .unwrap()
 });
 static BYTES_CHAR: LazyLock<AHashMap<u8, char>> = LazyLock::new(bytes_char);
+/// O(1) array lookup for byte-to-char mapping, used by the fast encode path.
+static BYTES_CHAR_TABLE: LazyLock<[char; 256]> = LazyLock::new(|| {
+    let map = bytes_char();
+    let mut table = ['\0'; 256];
+    for (b, c) in map {
+        table[b as usize] = c;
+    }
+    table
+});
 static CHAR_BYTES: LazyLock<AHashMap<char, u8>> =
     LazyLock::new(|| bytes_char().into_iter().map(|(c, b)| (b, c)).collect());
 
@@ -95,6 +104,55 @@ impl ByteLevel {
         BYTES_CHAR.values().copied().collect()
     }
 
+    /// Fused regex + byte-level encode + tokenize pipeline for the fast
+    /// path.  Produces token IDs directly from the input text without
+    /// creating ~2000 separate NormalizedString/Split heap objects.
+    ///
+    /// All byte-level encoded segments are written into a single contiguous
+    /// String buffer; BPE receives `&str` slices into that buffer.
+    pub fn encode_ids_fast<F>(
+        &self,
+        text: &str,
+        tokenize_ids: F,
+        type_id: u32,
+    ) -> Result<Encoding>
+    where
+        F: Fn(&str) -> Result<Vec<u32>>,
+    {
+        let table = &*BYTES_CHAR_TABLE;
+        let re_ref: &SysRegex = &RE;
+
+        // Single contiguous buffer for all byte-level encoded segments.
+        let mut buf = String::with_capacity(text.len() * 2);
+        // Segment boundaries (start byte offset into buf).
+        let mut seg_starts: Vec<u32> = Vec::with_capacity(text.len() / 3);
+
+        for (match_start, match_end) in re_ref.find_iter(text) {
+            seg_starts.push(buf.len() as u32);
+            let segment = &text[match_start..match_end];
+            for byte in segment.as_bytes() {
+                buf.push(table[*byte as usize]);
+            }
+        }
+        seg_starts.push(buf.len() as u32);
+
+        // Tokenize each segment and push IDs into a pre-sized Encoding.
+        let n_segs = seg_starts.len() - 1;
+        let mut encoding = Encoding::with_capacity(n_segs);
+        for i in 0..n_segs {
+            let start = seg_starts[i] as usize;
+            let end = seg_starts[i + 1] as usize;
+            let segment = &buf[start..end];
+            if !segment.is_empty() {
+                for id in tokenize_ids(segment)? {
+                    encoding.push_fast(id, type_id);
+                }
+            }
+        }
+        encoding.finish_fast();
+        Ok(encoding)
+    }
+
     #[must_use]
     pub fn add_prefix_space(mut self, v: bool) -> Self {
         self.add_prefix_space = v;
@@ -114,6 +172,29 @@ impl ByteLevel {
     }
 }
 
+thread_local! {
+    static TRANSFORM_BUF: RefCell<Vec<(char, isize)>> = const { RefCell::new(Vec::new()) };
+}
+
+fn byte_level_encode(normalized: &mut NormalizedString) {
+    TRANSFORM_BUF.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        buf.clear();
+        let s = normalized.get();
+        buf.reserve(s.len());
+        for (i, cur_char) in s.char_indices() {
+            let size = cur_char.len_utf8();
+            buf.extend(
+                s.as_bytes()[i..i + size]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, b)| (BYTES_CHAR[b], isize::from(i > 0))),
+            );
+        }
+        normalized.transform(buf.drain(..), 0);
+    });
+}
+
 /// As a `PreTokenizer`, `ByteLevel` is in charge of transforming all the unicode characters into
 /// their byte-level counterpart. It also splits the input according to the configured regex.
 // TODO: Give the ability to modify this regex
@@ -125,33 +206,15 @@ impl PreTokenizer for ByteLevel {
                 normalized.prepend(" ");
             }
             if self.use_regex {
-                normalized.split(re_ref, SplitDelimiterBehavior::Isolated)
+                let mut splits = normalized.split(re_ref, SplitDelimiterBehavior::Isolated)?;
+                for ns in &mut splits {
+                    byte_level_encode(ns);
+                }
+                Ok(splits)
             } else {
+                byte_level_encode(&mut normalized);
                 Ok(vec![normalized])
             }
-        })?;
-        thread_local! {
-            static TRANSFORM_BUF: RefCell<Vec<(char, isize)>> = const { RefCell::new(Vec::new()) };
-        }
-        pretokenized.normalize(|normalized| {
-            TRANSFORM_BUF.with(|cell| {
-                let mut buf = cell.borrow_mut();
-                buf.clear();
-                let s = normalized.get();
-                buf.reserve(s.len());
-                for (i, cur_char) in s.char_indices() {
-                    let size = cur_char.len_utf8();
-                    buf.extend(
-                        s.as_bytes()[i..i + size]
-                            .iter()
-                            .enumerate()
-                            .map(|(i, b)| (BYTES_CHAR[b], isize::from(i > 0))),
-                    );
-                }
-                // Drain into transform so the Vec retains its capacity for reuse.
-                normalized.transform(buf.drain(..), 0);
-                Ok(())
-            })
         })
     }
 }
