@@ -135,11 +135,23 @@ impl Encoding {
     /// Called once after the hot loop completes.
     pub fn finish_fast(&mut self) {
         let n = self.ids.len();
-        self.tokens.resize_with(n, String::new);
-        self.words.resize(n, None);
-        self.offsets.resize(n, (0, 0));
         self.special_tokens_mask.resize(n, 0);
         self.attention_mask.resize(n, 1);
+    }
+
+    /// Fill placeholder Vecs (tokens, words, offsets) that finish_fast
+    /// skips. Called lazily before any operation that reads these fields.
+    pub fn ensure_placeholders(&mut self) {
+        let n = self.ids.len();
+        if self.tokens.len() < n {
+            self.tokens.resize_with(n, String::new);
+        }
+        if self.words.len() < n {
+            self.words.resize(n, None);
+        }
+        if self.offsets.len() < n {
+            self.offsets.resize(n, (0, 0));
+        }
     }
 
     /// Return this Encoding to the shared pool for reuse.
