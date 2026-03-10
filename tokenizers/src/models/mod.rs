@@ -152,6 +152,13 @@ impl Model for ModelWrapper {
         }
     }
 
+    fn tokenize_ids(&self, sequence: &str) -> Result<Vec<u32>> {
+        match self {
+            Self::BPE(t) => t.tokenize_ids(sequence),
+            _ => Ok(self.tokenize(sequence)?.into_iter().map(|t| t.id).collect()),
+        }
+    }
+
     fn token_to_id(&self, token: &str) -> Option<u32> {
         match self {
             Self::WordLevel(t) => t.token_to_id(token),

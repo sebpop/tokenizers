@@ -193,11 +193,11 @@ impl PreTokenizedString {
     /// repeated Vec reallocation from flat_map().collect() with unknown size.
     pub fn tokenize_and_encode_fast<F>(
         self,
-        tokenize: F,
+        tokenize_ids: F,
         type_id: u32,
     ) -> Result<Encoding>
     where
-        F: Fn(&NormalizedString) -> Result<Vec<Token>>,
+        F: Fn(&NormalizedString) -> Result<Vec<u32>>,
     {
         let mut encoding = Encoding::with_capacity(self.splits.len());
         for split in self.splits {
@@ -206,8 +206,8 @@ impl PreTokenizedString {
                     encoding.push_fast(token.id, type_id);
                 }
             } else {
-                for token in tokenize(&split.normalized)? {
-                    encoding.push_fast(token.id, type_id);
+                for id in tokenize_ids(&split.normalized)? {
+                    encoding.push_fast(id, type_id);
                 }
             }
         }

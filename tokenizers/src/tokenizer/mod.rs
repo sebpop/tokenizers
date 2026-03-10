@@ -93,6 +93,13 @@ pub trait Model {
         self.tokenize(sequence)
     }
 
+    /// Return only token IDs, skipping Token struct overhead (40 bytes
+    /// of dead String + offsets per token).  Used by the fused
+    /// tokenize_and_encode_fast path.  Default extracts IDs from tokenize_fast.
+    fn tokenize_ids(&self, sequence: &str) -> Result<Vec<u32>> {
+        Ok(self.tokenize_fast(sequence)?.into_iter().map(|t| t.id).collect())
+    }
+
     /// Flush any per-thread cache buffer into the shared cache. No-op for models without a cache.
     fn flush_cache(&self) {}
 
@@ -1191,7 +1198,7 @@ where
         let pretokenized: PreTokenizedString = pretokenized.into();
         if offsets_type == OffsetType::None {
             return pretokenized.tokenize_and_encode_fast(
-                |normalized| self.model.tokenize_fast(normalized.get()),
+                |normalized| self.model.tokenize_ids(normalized.get()),
                 type_id,
             );
         }
