@@ -101,17 +101,27 @@ impl Encoding {
         self.sequence_ranges.clear();
     }
 
-    /// Push a single token into the Encoding with placeholder values
-    /// for fields unused on the OffsetType::None fast path.
+    /// Push only the hot fields (ids, type_ids) during the encode_fast
+    /// loop.  Call `finish_fast()` after the loop to bulk-fill the
+    /// remaining 5 Vecs.  This keeps the hot-loop write set to 8 bytes
+    /// per token (~16KB for 2000 tokens) instead of 64 bytes (~128KB),
+    /// fitting in L1d when two SMT siblings share a physical core.
     #[inline]
     pub fn push_fast(&mut self, id: u32, type_id: u32) {
         self.ids.push(id);
         self.type_ids.push(type_id);
-        self.tokens.push(String::new());
-        self.words.push(None);
-        self.offsets.push((0, 0));
-        self.special_tokens_mask.push(0);
-        self.attention_mask.push(1);
+    }
+
+    /// Bulk-fill the placeholder Vecs (tokens, words, offsets,
+    /// special_tokens_mask, attention_mask) to match ids.len().
+    /// Called once after the hot loop completes.
+    pub fn finish_fast(&mut self) {
+        let n = self.ids.len();
+        self.tokens.resize_with(n, String::new);
+        self.words.resize(n, None);
+        self.offsets.resize(n, (0, 0));
+        self.special_tokens_mask.resize(n, 0);
+        self.attention_mask.resize(n, 1);
     }
 
     /// Return this Encoding to the shared pool for reuse.

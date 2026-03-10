@@ -211,6 +211,7 @@ impl PreTokenizedString {
                 }
             }
         }
+        encoding.finish_fast();
         Ok(encoding)
     }
 
