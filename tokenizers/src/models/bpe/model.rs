@@ -673,6 +673,48 @@ impl Model for BPE {
         }
     }
 
+    fn tokenize_ids_into(&self, sequence: &str, out: &mut Vec<u32>) -> Result<()> {
+        if sequence.is_empty() {
+            return Ok(());
+        }
+        if self.dropout.is_some() && self.dropout != Some(0.0) {
+            let word = self.merge_word(sequence)?;
+            out.extend(word.get_chars_iter());
+            return Ok(());
+        }
+        if self.ignore_merges {
+            if let Some(id) = self.vocab.get(sequence) {
+                out.push(*id);
+                return Ok(());
+            }
+        }
+        BPE_LOCAL.with(|cell| {
+            let mut local = cell.borrow_mut();
+            if let Some(ref hit) = local.read_cache.get(sequence) {
+                out.extend(hit.get_chars_iter());
+                return Ok(());
+            }
+            if let Some(ref hit) = local.write_buf.get(sequence) {
+                out.extend(hit.get_chars_iter());
+                return Ok(());
+            }
+            let word = self.merge_word(sequence)?;
+            out.extend(word.get_chars_iter());
+            if sequence.len() < MAX_LENGTH {
+                let cap = self
+                    .cache
+                    .as_ref()
+                    .map(|c| c.capacity)
+                    .unwrap_or(DEFAULT_CACHE_CAPACITY);
+                if local.read_cache.len() >= cap {
+                    local.read_cache.clear();
+                }
+                local.read_cache.insert(sequence.to_owned(), word);
+            }
+            Ok(())
+        })
+    }
+
     fn token_to_id(&self, token: &str) -> Option<u32> {
         self.vocab.get(token).copied()
     }

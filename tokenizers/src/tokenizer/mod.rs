@@ -107,6 +107,13 @@ pub trait Model {
         Ok(self.tokenize_fast(sequence)?.into_iter().map(|t| t.id).collect())
     }
 
+    /// Push token IDs directly into `out`, avoiding intermediate Vec
+    /// allocation per segment.  Default calls `tokenize_ids` and extends.
+    fn tokenize_ids_into(&self, sequence: &str, out: &mut Vec<u32>) -> Result<()> {
+        out.extend(self.tokenize_ids(sequence)?);
+        Ok(())
+    }
+
     /// Flush any per-thread cache buffer into the shared cache. No-op for models without a cache.
     fn flush_cache(&self) {}
 
@@ -781,7 +788,7 @@ where
                     if let Some(bl) = pt.as_byte_level() {
                         return bl.encode_ids_fast(
                             seq.as_ref(),
-                            |segment| self.model.tokenize_ids(segment),
+                            |segment, out| self.model.tokenize_ids_into(segment, out),
                             type_id,
                         );
                     }

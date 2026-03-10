@@ -123,11 +123,11 @@ impl ByteLevel {
     pub fn encode_ids_fast<F>(
         &self,
         text: &str,
-        tokenize_ids: F,
+        tokenize_ids_into: F,
         type_id: u32,
     ) -> Result<Encoding>
     where
-        F: Fn(&str) -> Result<Vec<u32>>,
+        F: Fn(&str, &mut Vec<u32>) -> Result<()>,
     {
         let table = &*BYTES_CHAR_TABLE;
         let re_ref: &SysRegex = &RE;
@@ -146,16 +146,19 @@ impl ByteLevel {
         }
         seg_starts.push(buf.len() as u32);
 
-        // Tokenize each segment and push IDs into a pre-sized Encoding.
+        // Tokenize each segment, pushing IDs directly into the Encoding.
         let n_segs = seg_starts.len() - 1;
-        let mut encoding = Encoding::with_capacity(n_segs);
+        let mut encoding = Encoding::with_capacity(n_segs * 2);
         for i in 0..n_segs {
             let start = seg_starts[i] as usize;
             let end = seg_starts[i + 1] as usize;
             let segment = &buf[start..end];
             if !segment.is_empty() {
-                for id in tokenize_ids(segment)? {
-                    encoding.push_fast(id, type_id);
+                let before = encoding.get_ids().len();
+                tokenize_ids_into(segment, encoding.ids_mut())?;
+                let added = encoding.get_ids().len() - before;
+                for _ in 0..added {
+                    encoding.type_ids_push(type_id);
                 }
             }
         }

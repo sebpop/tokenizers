@@ -112,6 +112,18 @@ impl Encoding {
         self.type_ids.push(type_id);
     }
 
+    /// Direct mutable access to the ids Vec for push-into patterns.
+    #[inline]
+    pub fn ids_mut(&mut self) -> &mut Vec<u32> {
+        &mut self.ids
+    }
+
+    /// Push a single type_id (used when IDs are pushed directly via ids_mut).
+    #[inline]
+    pub fn type_ids_push(&mut self, type_id: u32) {
+        self.type_ids.push(type_id);
+    }
+
     /// Bulk-fill the placeholder Vecs (tokens, words, offsets,
     /// special_tokens_mask, attention_mask) to match ids.len().
     /// Called once after the hot loop completes.
@@ -517,6 +529,15 @@ impl Encoding {
                     original_self_len + range.start..original_self_len + range.end,
                 )
             }));
+        let pair_len = pair.ids.len();
+        self.ids.reserve(pair_len);
+        self.type_ids.reserve(pair_len);
+        self.tokens.reserve(pair_len);
+        self.words.reserve(pair_len);
+        self.offsets.reserve(pair_len);
+        self.special_tokens_mask.reserve(pair_len);
+        self.attention_mask.reserve(pair_len);
+
         self.ids.extend(pair.ids);
         self.type_ids.extend(pair.type_ids);
         self.tokens.extend(pair.tokens);
