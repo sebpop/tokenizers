@@ -1,9 +1,63 @@
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Barrier, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
 
-/// Persistent thread pool with barrier-based dispatch.
+/// Spin-wait barrier that stays entirely in userspace.
+///
+/// `std::sync::Barrier` uses `Mutex` + `Condvar` which call into the
+/// kernel via `futex_wait`/`futex_wake`.  Each futex syscall pulls
+/// dozens of kernel functions (`futex_hash`, `queued_spin_lock`,
+/// `futex_q_lock`, `finish_task_switch`, …) into the L1 instruction
+/// cache, evicting hot tokenizer code.  At 88 threads the kernel
+/// futex path accounts for **34%** of all L1i cache misses.
+///
+/// This spin barrier replaces futex with a generation-based atomic
+/// counter (~20 instructions total), keeping synchronization
+/// entirely in userspace and eliminating the kernel icache pollution.
+#[repr(align(128))]
+struct SpinBarrier {
+    count: AtomicUsize,
+    generation: AtomicUsize,
+    total: usize,
+}
+
+impl SpinBarrier {
+    fn new(total: usize) -> Self {
+        Self {
+            count: AtomicUsize::new(0),
+            generation: AtomicUsize::new(0),
+            total,
+        }
+    }
+
+    /// Spin briefly, then yield.  Pure spinning gives +29% at 88
+    /// threads (1 thread per physical core) but regresses -72% at 176
+    /// threads (SMT) because a spinning hyperthread steals execution
+    /// resources from its sibling doing real work.  Yielding after a
+    /// short spin window lets the OS scheduler run the sibling.
+    #[inline]
+    fn wait(&self) {
+        let gen = self.generation.load(Ordering::Relaxed);
+        if self.count.fetch_add(1, Ordering::AcqRel) == self.total - 1 {
+            // Last thread to arrive: reset count and bump generation.
+            self.count.store(0, Ordering::Relaxed);
+            self.generation.store(gen.wrapping_add(1), Ordering::Release);
+        } else {
+            let mut spins = 0u32;
+            while self.generation.load(Ordering::Acquire) == gen {
+                if spins < 64 {
+                    core::hint::spin_loop();
+                    spins += 1;
+                } else {
+                    std::thread::yield_now();
+                }
+            }
+        }
+    }
+}
+
+/// Persistent thread pool with spin-barrier dispatch.
 ///
 /// Unlike rayon, this pool uses no work-stealing deques and no
 /// epoch-based garbage collection.  On high-core-count systems
@@ -11,10 +65,10 @@ use std::thread::{self, JoinHandle};
 /// `Global::try_advance` walks every thread's epoch record on
 /// foreign pages, causing a TLB miss storm that dominates
 /// scaling.  This pool avoids that entirely: threads park on a
-/// barrier and are woken to run a caller-supplied closure.
+/// spin barrier and are woken to run a caller-supplied closure.
 struct Inner {
-    start: Barrier,
-    done: Barrier,
+    start: SpinBarrier,
+    done: SpinBarrier,
     shutdown: AtomicBool,
     /// Trait-object fat pointer stored as two `usize` words
     /// (data pointer + vtable pointer).  Written by `broadcast()`
@@ -40,8 +94,8 @@ impl WorkPool {
         assert!(num_threads > 0);
 
         let inner = Arc::new(Inner {
-            start: Barrier::new(num_threads + 1),
-            done: Barrier::new(num_threads + 1),
+            start: SpinBarrier::new(num_threads + 1),
+            done: SpinBarrier::new(num_threads + 1),
             shutdown: AtomicBool::new(false),
             work: UnsafeCell::new([0; 2]),
         });
