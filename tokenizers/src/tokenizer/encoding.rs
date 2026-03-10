@@ -124,6 +124,12 @@ impl Encoding {
         self.type_ids.push(type_id);
     }
 
+    /// Direct mutable access to the type_ids Vec for bulk resize.
+    #[inline]
+    pub fn type_ids_mut(&mut self) -> &mut Vec<u32> {
+        &mut self.type_ids
+    }
+
     /// Bulk-fill the placeholder Vecs (tokens, words, offsets,
     /// special_tokens_mask, attention_mask) to match ids.len().
     /// Called once after the hot loop completes.

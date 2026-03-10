@@ -154,14 +154,12 @@ impl ByteLevel {
             let end = seg_starts[i + 1] as usize;
             let segment = &buf[start..end];
             if !segment.is_empty() {
-                let before = encoding.get_ids().len();
                 tokenize_ids_into(segment, encoding.ids_mut())?;
-                let added = encoding.get_ids().len() - before;
-                for _ in 0..added {
-                    encoding.type_ids_push(type_id);
-                }
             }
         }
+        // Bulk-fill type_ids to match ids length (single resize vs ~3000 pushes).
+        let n_ids = encoding.get_ids().len();
+        encoding.type_ids_mut().resize(n_ids, type_id);
         encoding.finish_fast();
         Ok(encoding)
     }
