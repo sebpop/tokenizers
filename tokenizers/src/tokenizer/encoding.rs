@@ -130,9 +130,16 @@ impl Encoding {
         &mut self.type_ids
     }
 
-    /// Bulk-fill the placeholder Vecs (tokens, words, offsets,
-    /// special_tokens_mask, attention_mask) to match ids.len().
+    /// Bulk-fill the placeholder Vecs (special_tokens_mask,
+    /// attention_mask) to match ids.len().
     /// Called once after the hot loop completes.
+    ///
+    /// `#[inline(never)]` prevents LTO from inlining the vectorized
+    /// NEON fill loops into the hot encode path.  Without this, the
+    /// compiler generates ~1.3 KB of unrolled store-pair loops that
+    /// evict hot tokenizer code from L1i cache (5.2% of all L1i
+    /// misses at 88 threads).
+    #[inline(never)]
     pub fn finish_fast(&mut self) {
         let n = self.ids.len();
         self.special_tokens_mask.resize(n, 0);
@@ -550,30 +557,37 @@ impl Encoding {
         let pair_len = pair.ids.len();
         self.ids.reserve(pair_len);
         self.type_ids.reserve(pair_len);
-        self.tokens.reserve(pair_len);
-        self.words.reserve(pair_len);
-        self.offsets.reserve(pair_len);
         self.special_tokens_mask.reserve(pair_len);
         self.attention_mask.reserve(pair_len);
 
         self.ids.extend(pair.ids);
         self.type_ids.extend(pair.type_ids);
-        self.tokens.extend(pair.tokens);
-        self.words.extend(pair.words);
-
-        let starting_offset = if growing_offsets {
-            self.offsets.last().map_or(0, |o| o.1)
-        } else {
-            0
-        };
-        self.offsets.extend(
-            pair.offsets
-                .into_iter()
-                .map(|(start, end)| (start + starting_offset, end + starting_offset))
-                .collect::<Vec<_>>(),
-        );
         self.special_tokens_mask.extend(pair.special_tokens_mask);
         self.attention_mask.extend(pair.attention_mask);
+
+        // Skip tokens/words/offsets when both sides are empty
+        // (finish_fast leaves them unpopulated in the fast encode path).
+        if !pair.tokens.is_empty() || !self.tokens.is_empty() {
+            self.tokens.reserve(pair_len);
+            self.tokens.extend(pair.tokens);
+        }
+        if !pair.words.is_empty() || !self.words.is_empty() {
+            self.words.reserve(pair_len);
+            self.words.extend(pair.words);
+        }
+        if !pair.offsets.is_empty() || !self.offsets.is_empty() {
+            self.offsets.reserve(pair_len);
+            let starting_offset = if growing_offsets {
+                self.offsets.last().map_or(0, |o| o.1)
+            } else {
+                0
+            };
+            self.offsets.extend(
+                pair.offsets
+                    .into_iter()
+                    .map(|(start, end)| (start + starting_offset, end + starting_offset)),
+            );
+        }
         self.overflowing = overflowings;
     }
 
