@@ -33,8 +33,60 @@ thread_local!(static BPE_LOCAL: RefCell<BpeLocalCache> = RefCell::new(BpeLocalCa
 
 pub type Vocab = AHashMap<String, u32>;
 type VocabR = AHashMap<u32, String>;
-pub type MergeMap = AHashMap<Pair, (u32, u32)>;
 pub type Merges = Vec<(String, String)>;
+
+/// Sorted merge table for cache-friendly pair lookups.
+///
+/// AHashMap scatters 50K entries across ~1.2 MB with randomized bucket
+/// placement, causing L1d misses on every probe.  This sorted array
+/// uses binary search: O(log 50256) = 16 probes where the top ~10
+/// levels stay hot in L1d cache.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MergeMap {
+    /// Sorted by encoded key `(left << 32 | right)`.
+    entries: Vec<(u64, u32, u32)>,
+}
+
+impl MergeMap {
+    pub fn with_capacity(cap: usize) -> Self {
+        Self {
+            entries: Vec::with_capacity(cap),
+        }
+    }
+
+    /// Build from an iterator of `(Pair, (rank, new_id))`.
+    pub fn from_iter(iter: impl Iterator<Item = (Pair, (u32, u32))>) -> Self {
+        let mut entries: Vec<(u64, u32, u32)> = iter
+            .map(|((left, right), (rank, new_id))| {
+                ((left as u64) << 32 | right as u64, rank, new_id)
+            })
+            .collect();
+        entries.sort_unstable_by_key(|&(key, _, _)| key);
+        Self { entries }
+    }
+
+    #[inline]
+    pub fn get(&self, pair: &Pair) -> Option<(u32, u32)> {
+        let key = (pair.0 as u64) << 32 | pair.1 as u64;
+        self.entries
+            .binary_search_by_key(&key, |&(k, _, _)| k)
+            .ok()
+            .map(|idx| (self.entries[idx].1, self.entries[idx].2))
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Iterate as `(Pair, (rank, new_id))` for serialization.
+    pub fn iter(&self) -> impl Iterator<Item = (Pair, (u32, u32))> + '_ {
+        self.entries.iter().map(|&(key, rank, new_id)| {
+            let left = (key >> 32) as u32;
+            let right = key as u32;
+            ((left, right), (rank, new_id))
+        })
+    }
+}
 
 struct Config {
     files: Option<(String, String)>,
@@ -188,7 +240,7 @@ impl BpeBuilder {
         } else {
             0
         };
-        let merge_map: MergeMap = self
+        let merge_pairs: Vec<(Pair, (u32, u32))> = self
             .config
             .merges
             .into_iter()
@@ -206,7 +258,8 @@ impl BpeBuilder {
                     .ok_or(Error::MergeTokenOutOfVocabulary(new_token))?;
                 Ok(((*a_id, *b_id), (i as u32, *new_id)))
             })
-            .collect::<Result<MergeMap>>()?;
+            .collect::<Result<Vec<_>>>()?;
+        let merge_map = MergeMap::from_iter(merge_pairs.into_iter());
 
         // merges.insert(pair, (rank as u32, *new_id));
 
@@ -748,12 +801,12 @@ impl Model for BPE {
             .iter()
             .collect();
         let mut merges_file = File::create(&merges_path)?;
-        let mut merges: Vec<(&Pair, &u32)> = self
+        let mut merges: Vec<(Pair, u32)> = self
             .merges
             .iter()
             .map(|(pair, (rank, _))| (pair, rank))
             .collect();
-        merges.sort_unstable_by_key(|k| *k.1);
+        merges.sort_unstable_by_key(|k| k.1);
         merges_file.write_all(b"#version: 0.2\n")?;
         merges_file.write_all(
             &merges
@@ -949,7 +1002,7 @@ mod tests {
         let bpe = builder.build().unwrap();
 
         // Check merges.
-        assert_eq!(bpe.merges.get(&(0, 1)).unwrap(), &(0u32, 3u32));
+        assert_eq!(bpe.merges.get(&(0, 1)).unwrap(), (0u32, 3u32));
 
         // Check vocab.
         assert_eq!(bpe.vocab.get("a").unwrap(), &0u32);
