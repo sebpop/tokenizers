@@ -502,18 +502,14 @@ impl Encoding {
 
     /// Merge all Encodings together
     pub fn merge<I: IntoIterator<Item = Encoding>>(encodings: I, growing_offsets: bool) -> Self {
-        let mut encoding = Encoding::default();
-
-        // TODO this is suboptimal as we're doing this iteratively instead of preallocating
-        // all the encodings sizes all at once and only copying into this preallocated vector
-        // https://github.com/huggingface/tokenizers/pull/1049
-
-        // In order to fix, we just need to preallocate all vectors, then copy everything
-        // into it (and deal with overlowings correctly)
-        for sub in encodings {
+        let mut iter = encodings.into_iter();
+        let mut encoding = match iter.next() {
+            Some(enc) => enc,
+            None => return Encoding::default(),
+        };
+        for sub in iter {
             encoding.merge_with(sub, growing_offsets);
         }
-
         encoding
     }
 
