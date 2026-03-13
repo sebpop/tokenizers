@@ -3,18 +3,56 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
 
+/// Detect SMT at process init by checking CPU topology.
+/// On Linux: reads thread_siblings_list for CPU 0.
+/// Returns true if the CPU has SMT siblings (e.g., Vera: "0-1").
+/// Returns false if no SMT (e.g., Grace: "0", or non-Linux).
+fn detect_smt() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string(
+            "/sys/devices/system/cpu/cpu0/topology/thread_siblings_list",
+        )
+        .map(|s| s.trim().contains('-') || s.trim().contains(','))
+        .unwrap_or(false)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+static HAS_SMT: OnceLock<bool> = OnceLock::new();
+
+#[inline(always)]
+fn has_smt() -> bool {
+    *HAS_SMT.get().unwrap_or(&false)
+}
+
 /// Spin-wait barrier that stays entirely in userspace.
 ///
-/// `std::sync::Barrier` uses `Mutex` + `Condvar` which call into the
-/// kernel via `futex_wait`/`futex_wake`.  Each futex syscall pulls
-/// dozens of kernel functions (`futex_hash`, `queued_spin_lock`,
-/// `futex_q_lock`, `finish_task_switch`, …) into the L1 instruction
-/// cache, evicting hot tokenizer code.  At 88 threads the kernel
-/// futex path accounts for **34%** of all L1i cache misses.
+/// Uses ISB (spin_loop) for the fast path, then selects the slow path
+/// based on SMT detection at process init:
 ///
-/// This spin barrier replaces futex with a generation-based atomic
-/// counter (~20 instructions total), keeping synchronization
-/// entirely in userspace and eliminating the kernel icache pollution.
+/// - **No SMT** (Grace, Graviton): pure ISB spin.  No overhead from
+///   WFI or sched_yield.
+///
+/// - **SMT** (Vera): WFI in the slow path.  On aarch64 Linux with
+///   SMT (e.g., Vera), the ntwi_yield kernel module is required to
+///   yield execution resources of a shared physical core to the
+///   sibling thread that is not blocked on the spin_loop.  The module
+///   traps WFI from EL0, sets TIF_NEED_RESCHED, and the kernel
+///   return-to-EL0 path calls schedule() to yield to the sibling.
+///   If the kernel module is NOT loaded, WFI executes natively as an
+///   86 ns idle cycle without yielding SMT resources, causing severe
+///   performance degradation at thread counts above the physical core
+///   count.  Measured on Vera (88 physical cores, 176 logical):
+///     - 176t with module:    11.40 GiB/s (full SMT utilization)
+///     - 176t without module:  2.06 GiB/s (5.5x slower, SMT starved)
+///     - 88t (no SMT needed): 11.26 GiB/s (unaffected)
+///
+/// - **x86_64 / macOS**: `core::hint::spin_loop()` which emits
+///   `pause` (x86) or `isb` (aarch64-mac).
 #[repr(align(128))]
 struct SpinBarrier {
     count: AtomicUsize,
@@ -31,11 +69,6 @@ impl SpinBarrier {
         }
     }
 
-    /// Spin briefly, then yield.  Pure spinning gives +29% at 88
-    /// threads (1 thread per physical core) but regresses -72% at 176
-    /// threads (SMT) because a spinning hyperthread steals execution
-    /// resources from its sibling doing real work.  Yielding after a
-    /// short spin window lets the OS scheduler run the sibling.
     #[inline]
     fn wait(&self) {
         let gen = self.generation.load(Ordering::Relaxed);
@@ -49,8 +82,15 @@ impl SpinBarrier {
                 if spins < 64 {
                     core::hint::spin_loop();
                     spins += 1;
+                } else if has_smt() {
+                    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+                    unsafe {
+                        core::arch::asm!("wfi", options(nomem, nostack));
+                    }
+                    #[cfg(not(all(target_arch = "aarch64", target_os = "linux")))]
+                    core::hint::spin_loop();
                 } else {
-                    std::thread::yield_now();
+                    core::hint::spin_loop();
                 }
             }
         }
@@ -92,6 +132,7 @@ pub struct WorkPool {
 impl WorkPool {
     pub fn new(num_threads: usize) -> Self {
         assert!(num_threads > 0);
+        HAS_SMT.get_or_init(detect_smt);
 
         let inner = Arc::new(Inner {
             start: SpinBarrier::new(num_threads + 1),
@@ -222,5 +263,11 @@ mod tests {
             });
         }
         assert_eq!(counter.load(Ordering::Relaxed), 40);
+    }
+
+    #[test]
+    fn test_smt_detection() {
+        let result = detect_smt();
+        println!("SMT detected: {result}");
     }
 }
