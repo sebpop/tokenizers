@@ -257,7 +257,10 @@ fn byte_level_decode_tokens(tokens: &[&str]) -> String {
             buf.extend_from_slice(t.as_bytes());
         }
     }
-    String::from_utf8_lossy(&buf).into_owned()
+    match String::from_utf8(buf) {
+        Ok(s) => s,
+        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+    }
 }
 
 impl Decoder for ByteLevel {
@@ -276,7 +279,10 @@ impl Decoder for ByteLevel {
         for b in byte_slices {
             buf.extend_from_slice(b);
         }
-        Some(Ok(String::from_utf8_lossy(&buf).into_owned()))
+        Some(Ok(match String::from_utf8(buf) {
+            Ok(s) => s,
+            Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+        }))
     }
 }
 

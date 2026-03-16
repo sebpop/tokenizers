@@ -1042,12 +1042,12 @@ where
     fn decode_fused(&self, ids: &[u32], skip_special_tokens: bool) -> Option<Result<String>> {
         self.decoder.as_ref()?;
         let added = self.added_vocabulary.get_added_tokens_decoder();
+        let check_added = !added.is_empty();
 
-        // Tier 1: single-pass direct write with pre-decoded bytes.
         let first_bytes = self.model.id_to_decoded_bytes(*ids.first()?)?;
         let mut buf = Vec::with_capacity(ids.len() * first_bytes.len().max(4));
         for &id in ids {
-            if added.contains_key(&id) {
+            if check_added && added.contains_key(&id) {
                 return None;
             }
             let bytes = self.model.id_to_decoded_bytes(id)?;
@@ -1060,7 +1060,12 @@ where
             }
             buf.extend_from_slice(bytes);
         }
-        Some(Ok(String::from_utf8_lossy(&buf).into_owned()))
+        // from_utf8 takes ownership of buf (zero-copy when valid UTF-8).
+        // from_utf8_lossy borrows then into_owned copies — avoid that.
+        Some(Ok(match String::from_utf8(buf) {
+            Ok(s) => s,
+            Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+        }))
     }
 
     /// Decode the given ids, back to a String
