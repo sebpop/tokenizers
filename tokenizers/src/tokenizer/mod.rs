@@ -1042,26 +1042,46 @@ where
     fn decode_fused(&self, ids: &[u32], skip_special_tokens: bool) -> Option<Result<String>> {
         self.decoder.as_ref()?;
         let added = self.added_vocabulary.get_added_tokens_decoder();
-        let check_added = !added.is_empty();
 
-        let first_bytes = self.model.id_to_decoded_bytes(*ids.first()?)?;
-        let mut buf = Vec::with_capacity(ids.len() * first_bytes.len().max(4));
+        // Determine whether per-token added-vocab check is needed.
+        // When all added-vocab IDs are above the max input ID, skip
+        // the HashMap probe entirely (common case for normal text).
+        let min_added_id = added.keys().min().copied().unwrap_or(u32::MAX);
+        let max_input_id = ids.iter().max().copied().unwrap_or(0);
+        let check_added = !added.is_empty() && max_input_id >= min_added_id;
+
+        // Pre-compute exact output size.
+        let mut total_len: usize = 0;
         for &id in ids {
-            if check_added && added.contains_key(&id) {
-                return None;
-            }
-            let bytes = self.model.id_to_decoded_bytes(id)?;
-            if skip_special_tokens {
-                if let Some(tok) = self.model.id_to_token_ref(id) {
-                    if self.added_vocabulary.is_special_token(tok) {
+            if check_added {
+                if let Some(tok) = added.get(&id) {
+                    if skip_special_tokens && self.added_vocabulary.is_special_token(&tok.content) {
                         continue;
                     }
+                    total_len += tok.content.len();
+                    continue;
                 }
             }
+            total_len += self.model.id_to_decoded_bytes(id)?.len();
+        }
+
+        let mut buf = Vec::with_capacity(total_len);
+        for &id in ids {
+            if check_added {
+                if let Some(tok) = added.get(&id) {
+                    if skip_special_tokens && self.added_vocabulary.is_special_token(&tok.content) {
+                        continue;
+                    }
+                    buf.extend_from_slice(tok.content.as_bytes());
+                    continue;
+                }
+            }
+            // Safety: the size-computation pass above verified every
+            // non-added ID has pre-decoded bytes.
+            let bytes = unsafe { self.model.id_to_decoded_bytes(id).unwrap_unchecked() };
             buf.extend_from_slice(bytes);
         }
-        // from_utf8 takes ownership of buf (zero-copy when valid UTF-8).
-        // from_utf8_lossy borrows then into_owned copies — avoid that.
+
         Some(Ok(match String::from_utf8(buf) {
             Ok(s) => s,
             Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
