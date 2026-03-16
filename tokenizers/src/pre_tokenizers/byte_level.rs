@@ -237,22 +237,26 @@ impl PreTokenizer for ByteLevel {
 /// as String.
 impl Decoder for ByteLevel {
     fn decode_chain(&self, tokens: Vec<String>) -> Result<Vec<String>> {
-        let toks = tokens
-            .into_iter()
-            .flat_map(|t| {
-                t.chars()
-                    .try_fold(vec![], |mut acc, c| {
-                        {
-                            let idx = c as usize;
-                            if idx < 512 { CHAR_BYTES_TABLE[idx] } else { None }
-                        }.map(|b| {
-                            acc.push(b);
-                            acc
-                        })
-                    })
-                    .unwrap_or_else(|| t.as_bytes().to_vec())
-            })
-            .collect::<Vec<u8>>();
+        let total_len: usize = tokens.iter().map(|t| t.len()).sum();
+        let mut toks = Vec::with_capacity(total_len);
+        let table = &*CHAR_BYTES_TABLE;
+        for t in &tokens {
+            let start = toks.len();
+            let mut all_mapped = true;
+            for c in t.chars() {
+                let idx = c as usize;
+                if let Some(&Some(b)) = table.get(idx) {
+                    toks.push(b);
+                } else {
+                    all_mapped = false;
+                    break;
+                }
+            }
+            if !all_mapped {
+                toks.truncate(start);
+                toks.extend_from_slice(t.as_bytes());
+            }
+        }
         Ok(vec![String::from_utf8_lossy(&toks).to_string()])
     }
 }
