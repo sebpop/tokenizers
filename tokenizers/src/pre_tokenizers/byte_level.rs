@@ -269,6 +269,15 @@ impl Decoder for ByteLevel {
     fn decode_fused(&self, token_strs: &[&str]) -> Option<Result<String>> {
         Some(Ok(byte_level_decode_tokens(token_strs)))
     }
+
+    fn decode_fused_bytes(&self, byte_slices: &[&[u8]]) -> Option<Result<String>> {
+        let total: usize = byte_slices.iter().map(|b| b.len()).sum();
+        let mut buf = Vec::with_capacity(total);
+        for b in byte_slices {
+            buf.extend_from_slice(b);
+        }
+        Some(Ok(String::from_utf8_lossy(&buf).into_owned()))
+    }
 }
 
 /// As a `PostProcessor`, `ByteLevel` is in charge of trimming the offsets if necessary.

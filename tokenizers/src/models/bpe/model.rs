@@ -1,4 +1,5 @@
 use super::{super::OrderedVocabIter, trainer::BpeTrainer, Error, Pair, Word};
+use crate::pre_tokenizers::byte_level::CHAR_BYTES_TABLE;
 use crate::tokenizer::{Model, Result, Token};
 use crate::utils::cache::{Cache, DEFAULT_CACHE_CAPACITY, MAX_LENGTH};
 use crate::utils::iter::ResultShunt;
@@ -14,6 +15,37 @@ use std::{
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
 };
+
+/// Pre-compute ByteLevel-decoded bytes for each entry in vocab_r_vec.
+/// For each token string, map chars through CHAR_BYTES_TABLE to get
+/// the raw bytes that ByteLevel::decode_chain would produce.
+pub(crate) fn build_vocab_decoded(vocab_r_vec: &[String]) -> Vec<Vec<u8>> {
+    let table = &*CHAR_BYTES_TABLE;
+    vocab_r_vec
+        .iter()
+        .map(|token| {
+            if token.is_empty() {
+                return Vec::new();
+            }
+            let mut bytes = Vec::with_capacity(token.len());
+            let mut all_mapped = true;
+            for c in token.chars() {
+                let idx = c as usize;
+                if let Some(&Some(b)) = table.get(idx) {
+                    bytes.push(b);
+                } else {
+                    all_mapped = false;
+                    break;
+                }
+            }
+            if !all_mapped {
+                bytes.clear();
+                bytes.extend_from_slice(token.as_bytes());
+            }
+            bytes
+        })
+        .collect()
+}
 
 /// Per-thread BPE cache state: a write buffer for batching inserts into the
 /// global sharded cache, and a read cache that avoids RwLock atomics on
@@ -234,6 +266,7 @@ impl BpeBuilder {
         for (&id, token) in &vocab_r {
             vocab_r_vec[id as usize] = token.clone();
         }
+        let vocab_decoded = build_vocab_decoded(&vocab_r_vec);
         let cache = match self.config.cache_capacity {
             0 => None,
             capacity => Some(Cache::new(capacity)),
@@ -272,6 +305,7 @@ impl BpeBuilder {
             vocab,
             vocab_r,
             vocab_r_vec,
+            vocab_decoded,
             merges: merge_map,
             cache,
             dropout: self.config.dropout,
@@ -295,6 +329,9 @@ pub struct BPE {
     /// Flat reverse vocabulary indexed by token ID for O(1) decode lookups.
     /// Empty string at index i means no token with that ID exists.
     pub(crate) vocab_r_vec: Vec<String>,
+    /// Pre-decoded bytes for each token ID (ByteLevel char→byte applied).
+    /// Built at construction time so decode skips per-char table lookups.
+    pub(crate) vocab_decoded: Vec<Vec<u8>>,
     /// Contains the mapping between Pairs and their (rank, new_id).
     pub(crate) merges: MergeMap,
     /// Contains the cache for optimizing the encoding step.
@@ -348,6 +385,7 @@ impl Clone for BPE {
             vocab: self.vocab.clone(),
             vocab_r: self.vocab_r.clone(),
             vocab_r_vec: self.vocab_r_vec.clone(),
+            vocab_decoded: self.vocab_decoded.clone(),
             merges: self.merges.clone(),
             cache: fresh_cache,
             dropout: self.dropout,
@@ -794,6 +832,13 @@ impl Model for BPE {
             .get(id as usize)
             .filter(|s| !s.is_empty())
             .map(|s| s.as_str())
+    }
+
+    fn id_to_decoded_bytes(&self, id: u32) -> Option<&[u8]> {
+        self.vocab_decoded
+            .get(id as usize)
+            .filter(|b| !b.is_empty())
+            .map(|b| b.as_slice())
     }
 
     fn save(&self, folder: &Path, name: Option<&str>) -> Result<Vec<PathBuf>> {

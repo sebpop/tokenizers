@@ -152,6 +152,13 @@ pub trait Model {
     fn id_to_token_ref(&self, _id: u32) -> Option<&str> {
         None
     }
+
+    /// Return pre-decoded bytes for a token ID (ByteLevel char→byte already applied).
+    /// Used by the fused decode path to skip per-char CHAR_BYTES_TABLE iteration.
+    /// Default returns `None`; BPE overrides with its pre-computed table.
+    fn id_to_decoded_bytes(&self, _id: u32) -> Option<&[u8]> {
+        None
+    }
 }
 
 /// A `PostProcessor` has the responsibility to post process an encoded output of the `Tokenizer`.
@@ -228,6 +235,13 @@ pub trait Decoder {
     /// Returns `None` if this decoder does not support the fused path
     /// (caller falls back to the owned-String path).
     fn decode_fused(&self, _token_strs: &[&str]) -> Option<Result<String>> {
+        None
+    }
+
+    /// Decode from pre-decoded byte slices (ByteLevel char→byte already applied).
+    /// Just concatenates bytes and converts to String.  Returns `None` if this
+    /// decoder does not support pre-decoded bytes.
+    fn decode_fused_bytes(&self, _byte_slices: &[&[u8]]) -> Option<Result<String>> {
         None
     }
 }
@@ -1017,15 +1031,17 @@ where
         }
     }
 
-    /// Fused decode: borrow token strings from the model and pass them
-    /// directly to the decoder without cloning.  Returns `None` if the
-    /// model or decoder does not support the fused path (caller falls
-    /// back to the owned-String path).
-    ///
-    /// Fast path conditions: all IDs map to model vocabulary (not added
-    /// vocabulary), and the decoder supports `decode_fused`.
+    /// Fused decode: try pre-decoded bytes first (skips per-char table lookup),
+    /// then borrowed &str path (skips String clone), then fall back to owned path.
     fn decode_fused(&self, ids: &[u32], skip_special_tokens: bool) -> Option<Result<String>> {
         let decoder = self.decoder.as_ref()?;
+
+        // Try pre-decoded bytes path (fastest: no per-char iteration).
+        if let Some(result) = self.decode_fused_bytes(ids, skip_special_tokens, decoder) {
+            return Some(result);
+        }
+
+        // Fall back to borrowed &str path (no String clone, but per-char decode).
         let mut token_refs: Vec<&str> = Vec::with_capacity(ids.len());
         for &id in ids {
             if self.added_vocabulary.simple_id_to_token(id).is_some() {
@@ -1038,6 +1054,26 @@ where
             token_refs.push(model_ref);
         }
         decoder.decode_fused(&token_refs)
+    }
+
+    /// Fastest fused path: use pre-decoded byte slices from the model.
+    fn decode_fused_bytes(&self, ids: &[u32], skip_special_tokens: bool, decoder: &D) -> Option<Result<String>> {
+        let mut byte_refs: Vec<&[u8]> = Vec::with_capacity(ids.len());
+        for &id in ids {
+            if self.added_vocabulary.simple_id_to_token(id).is_some() {
+                return None;
+            }
+            let bytes = self.model.id_to_decoded_bytes(id)?;
+            if skip_special_tokens {
+                if let Some(tok) = self.model.id_to_token_ref(id) {
+                    if self.added_vocabulary.is_special_token(tok) {
+                        continue;
+                    }
+                }
+            }
+            byte_refs.push(bytes);
+        }
+        decoder.decode_fused_bytes(&byte_refs)
     }
 
     /// Decode the given ids, back to a String
