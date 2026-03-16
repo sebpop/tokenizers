@@ -776,6 +776,10 @@ impl Model for BPE {
         self.vocab_r.get(&id).cloned()
     }
 
+    fn id_to_token_ref(&self, id: u32) -> Option<&str> {
+        self.vocab_r.get(&id).map(|s| s.as_str())
+    }
+
     fn save(&self, folder: &Path, name: Option<&str>) -> Result<Vec<PathBuf>> {
         let vocab_file_name = match name {
             Some(name) => format!("{name}-vocab.json"),

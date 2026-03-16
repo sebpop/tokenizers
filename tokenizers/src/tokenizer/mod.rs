@@ -142,6 +142,16 @@ pub trait Model {
     fn ids_to_tokens(&self, ids: &[u32]) -> Vec<Option<String>> {
         ids.iter().map(|id| self.id_to_token(*id)).collect()
     }
+
+    /// Borrow a token string by ID without cloning.
+    ///
+    /// Returns `None` if the model cannot provide a borrow (e.g., the
+    /// model is behind a lock).  The default returns `None`; models that
+    /// own their vocabulary (BPE, WordPiece, etc.) can override this to
+    /// enable the fused decode fast path that avoids N String clones.
+    fn id_to_token_ref(&self, _id: u32) -> Option<&str> {
+        None
+    }
 }
 
 /// A `PostProcessor` has the responsibility to post process an encoded output of the `Tokenizer`.
@@ -213,6 +223,13 @@ pub trait Decoder {
         Ok(results.join(""))
     }
     fn decode_chain(&self, tokens: Vec<String>) -> Result<Vec<String>>;
+
+    /// Decode from borrowed token string slices, avoiding String clones.
+    /// Returns `None` if this decoder does not support the fused path
+    /// (caller falls back to the owned-String path).
+    fn decode_fused(&self, _token_strs: &[&str]) -> Option<Result<String>> {
+        None
+    }
 }
 
 /// A `Trainer` has the responsibility to train a model. We feed it with lines/sentences
@@ -975,6 +992,10 @@ where
 
     /// Decode the given ids, back to a String.
     pub fn decode(&self, ids: &[u32], skip_special_tokens: bool) -> Result<String> {
+        if let Some(result) = self.decode_fused(ids, skip_special_tokens) {
+            return result;
+        }
+
         let model_tokens = self.model.ids_to_tokens(ids);
         let tokens = ids
             .iter()
@@ -994,6 +1015,29 @@ where
         } else {
             Ok(tokens.join(" "))
         }
+    }
+
+    /// Fused decode: borrow token strings from the model and pass them
+    /// directly to the decoder without cloning.  Returns `None` if the
+    /// model or decoder does not support the fused path (caller falls
+    /// back to the owned-String path).
+    ///
+    /// Fast path conditions: all IDs map to model vocabulary (not added
+    /// vocabulary), and the decoder supports `decode_fused`.
+    fn decode_fused(&self, ids: &[u32], skip_special_tokens: bool) -> Option<Result<String>> {
+        let decoder = self.decoder.as_ref()?;
+        let mut token_refs: Vec<&str> = Vec::with_capacity(ids.len());
+        for &id in ids {
+            if self.added_vocabulary.simple_id_to_token(id).is_some() {
+                return None;
+            }
+            let model_ref = self.model.id_to_token_ref(id)?;
+            if skip_special_tokens && self.added_vocabulary.is_special_token(model_ref) {
+                continue;
+            }
+            token_refs.push(model_ref);
+        }
+        decoder.decode_fused(&token_refs)
     }
 
     /// Decode the given ids, back to a String

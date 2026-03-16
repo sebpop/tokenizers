@@ -187,6 +187,15 @@ impl Model for ModelWrapper {
         }
     }
 
+    fn id_to_token_ref(&self, id: u32) -> Option<&str> {
+        match self {
+            Self::WordLevel(t) => t.id_to_token_ref(id),
+            Self::WordPiece(t) => t.id_to_token_ref(id),
+            Self::BPE(t) => t.id_to_token_ref(id),
+            Self::Unigram(t) => t.id_to_token_ref(id),
+        }
+    }
+
     fn get_vocab(&self) -> HashMap<String, u32> {
         match self {
             Self::WordLevel(t) => t.get_vocab(),

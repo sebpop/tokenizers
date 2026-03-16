@@ -235,29 +235,39 @@ impl PreTokenizer for ByteLevel {
 /// This decoder will consume the tokens and merge them in one step to alleviate
 /// the fact that single token decoded might be a byte not representable as
 /// as String.
-impl Decoder for ByteLevel {
-    fn decode_chain(&self, tokens: Vec<String>) -> Result<Vec<String>> {
-        let total_len: usize = tokens.iter().map(|t| t.len()).sum();
-        let mut toks = Vec::with_capacity(total_len);
-        let table = &*CHAR_BYTES_TABLE;
-        for t in &tokens {
-            let start = toks.len();
-            let mut all_mapped = true;
-            for c in t.chars() {
-                let idx = c as usize;
-                if let Some(&Some(b)) = table.get(idx) {
-                    toks.push(b);
-                } else {
-                    all_mapped = false;
-                    break;
-                }
-            }
-            if !all_mapped {
-                toks.truncate(start);
-                toks.extend_from_slice(t.as_bytes());
+/// Map token chars to bytes via CHAR_BYTES_TABLE into a single pre-allocated buffer.
+fn byte_level_decode_tokens(tokens: &[&str]) -> String {
+    let total_len: usize = tokens.iter().map(|t| t.len()).sum();
+    let mut buf = Vec::with_capacity(total_len);
+    let table = &*CHAR_BYTES_TABLE;
+    for t in tokens {
+        let start = buf.len();
+        let mut all_mapped = true;
+        for c in t.chars() {
+            let idx = c as usize;
+            if let Some(&Some(b)) = table.get(idx) {
+                buf.push(b);
+            } else {
+                all_mapped = false;
+                break;
             }
         }
-        Ok(vec![String::from_utf8_lossy(&toks).to_string()])
+        if !all_mapped {
+            buf.truncate(start);
+            buf.extend_from_slice(t.as_bytes());
+        }
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+impl Decoder for ByteLevel {
+    fn decode_chain(&self, tokens: Vec<String>) -> Result<Vec<String>> {
+        let refs: Vec<&str> = tokens.iter().map(|s| s.as_str()).collect();
+        Ok(vec![byte_level_decode_tokens(&refs)])
+    }
+
+    fn decode_fused(&self, token_strs: &[&str]) -> Option<Result<String>> {
+        Some(Ok(byte_level_decode_tokens(token_strs)))
     }
 }
 
