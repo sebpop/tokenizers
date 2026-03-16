@@ -1031,36 +1031,23 @@ where
         }
     }
 
-    /// Fused decode: try pre-decoded bytes first (skips per-char table lookup),
-    /// then borrowed &str path (skips String clone), then fall back to owned path.
+    /// Fused decode: single-pass direct write into output buffer.
+    ///
+    /// Three tiers, tried in order:
+    /// 1. Pre-decoded bytes (fastest): extend output buffer directly per ID.
+    /// 2. Borrowed &str + decoder.decode_fused (no String clone).
+    /// 3. Return None → caller uses the owned-String slow path.
+    ///
+    /// Falls back if any ID is in the added vocabulary (rare for normal text).
     fn decode_fused(&self, ids: &[u32], skip_special_tokens: bool) -> Option<Result<String>> {
-        let decoder = self.decoder.as_ref()?;
+        self.decoder.as_ref()?;
+        let added = self.added_vocabulary.get_added_tokens_decoder();
 
-        // Try pre-decoded bytes path (fastest: no per-char iteration).
-        if let Some(result) = self.decode_fused_bytes(ids, skip_special_tokens, decoder) {
-            return Some(result);
-        }
-
-        // Fall back to borrowed &str path (no String clone, but per-char decode).
-        let mut token_refs: Vec<&str> = Vec::with_capacity(ids.len());
+        // Tier 1: single-pass direct write with pre-decoded bytes.
+        let first_bytes = self.model.id_to_decoded_bytes(*ids.first()?)?;
+        let mut buf = Vec::with_capacity(ids.len() * first_bytes.len().max(4));
         for &id in ids {
-            if self.added_vocabulary.simple_id_to_token(id).is_some() {
-                return None;
-            }
-            let model_ref = self.model.id_to_token_ref(id)?;
-            if skip_special_tokens && self.added_vocabulary.is_special_token(model_ref) {
-                continue;
-            }
-            token_refs.push(model_ref);
-        }
-        decoder.decode_fused(&token_refs)
-    }
-
-    /// Fastest fused path: use pre-decoded byte slices from the model.
-    fn decode_fused_bytes(&self, ids: &[u32], skip_special_tokens: bool, decoder: &D) -> Option<Result<String>> {
-        let mut byte_refs: Vec<&[u8]> = Vec::with_capacity(ids.len());
-        for &id in ids {
-            if self.added_vocabulary.simple_id_to_token(id).is_some() {
+            if added.contains_key(&id) {
                 return None;
             }
             let bytes = self.model.id_to_decoded_bytes(id)?;
@@ -1071,9 +1058,9 @@ where
                     }
                 }
             }
-            byte_refs.push(bytes);
+            buf.extend_from_slice(bytes);
         }
-        decoder.decode_fused_bytes(&byte_refs)
+        Some(Ok(String::from_utf8_lossy(&buf).into_owned()))
     }
 
     /// Decode the given ids, back to a String
