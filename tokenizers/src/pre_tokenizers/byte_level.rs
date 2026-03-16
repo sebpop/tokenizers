@@ -129,39 +129,49 @@ impl ByteLevel {
     where
         F: Fn(&str, &mut Vec<u32>) -> Result<()>,
     {
+        // Thread-local buffers: clear()+reuse retains capacity from
+        // previous documents, eliminating per-document allocations
+        // after the first call.  (Nathan Tuck: "zero allocate".)
+        thread_local! {
+            static BUF: std::cell::RefCell<String> = std::cell::RefCell::new(String::new());
+            static SEG_STARTS: std::cell::RefCell<Vec<u32>> = std::cell::RefCell::new(Vec::new());
+        }
+
         let table = &*BYTES_CHAR_TABLE;
         let re_ref: &SysRegex = &RE;
 
-        // Single contiguous buffer for all byte-level encoded segments.
-        let mut buf = String::with_capacity(text.len() * 2);
-        // Segment boundaries (start byte offset into buf).
-        let mut seg_starts: Vec<u32> = Vec::with_capacity(text.len() / 3);
+        BUF.with(|buf_cell| {
+        SEG_STARTS.with(|segs_cell| {
+            let mut buf = buf_cell.borrow_mut();
+            let mut seg_starts = segs_cell.borrow_mut();
+            buf.clear();
+            seg_starts.clear();
 
-        for (match_start, match_end) in re_ref.find_iter(text) {
+            for (match_start, match_end) in re_ref.find_iter(text) {
+                seg_starts.push(buf.len() as u32);
+                let segment = &text[match_start..match_end];
+                for byte in segment.as_bytes() {
+                    buf.push(table[*byte as usize]);
+                }
+            }
             seg_starts.push(buf.len() as u32);
-            let segment = &text[match_start..match_end];
-            for byte in segment.as_bytes() {
-                buf.push(table[*byte as usize]);
-            }
-        }
-        seg_starts.push(buf.len() as u32);
 
-        // Tokenize each segment, pushing IDs directly into the Encoding.
-        let n_segs = seg_starts.len() - 1;
-        let mut encoding = Encoding::with_capacity(n_segs * 2);
-        for i in 0..n_segs {
-            let start = seg_starts[i] as usize;
-            let end = seg_starts[i + 1] as usize;
-            let segment = &buf[start..end];
-            if !segment.is_empty() {
-                tokenize_ids_into(segment, encoding.ids_mut())?;
+            let n_segs = seg_starts.len() - 1;
+            let mut encoding = Encoding::pooled_or_with_capacity(n_segs * 2);
+            for i in 0..n_segs {
+                let start = seg_starts[i] as usize;
+                let end = seg_starts[i + 1] as usize;
+                let segment = &buf[start..end];
+                if !segment.is_empty() {
+                    tokenize_ids_into(segment, encoding.ids_mut())?;
+                }
             }
-        }
-        // Bulk-fill type_ids to match ids length (single resize vs ~3000 pushes).
-        let n_ids = encoding.get_ids().len();
-        encoding.type_ids_mut().resize(n_ids, type_id);
-        encoding.finish_fast();
-        Ok(encoding)
+            let n_ids = encoding.get_ids().len();
+            encoding.type_ids_mut().resize(n_ids, type_id);
+            encoding.finish_fast();
+            Ok(encoding)
+        })
+        })
     }
 
     #[must_use]

@@ -81,8 +81,9 @@ impl Encoding {
     }
 
     /// Take a cleared Encoding from the shared pool, or allocate a new one.
-    fn pooled_or_with_capacity(len: usize) -> Self {
-        if let Some(enc) = ENCODING_POOL.lock().unwrap().pop() {
+    pub(crate) fn pooled_or_with_capacity(len: usize) -> Self {
+        if let Some(mut enc) = ENCODING_POOL.lock().unwrap().pop() {
+            enc.clear();
             return enc;
         }
         Self::with_capacity(len)

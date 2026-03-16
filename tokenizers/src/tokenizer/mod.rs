@@ -184,7 +184,16 @@ pub trait PostProcessor {
                 .get_overflowing_mut()
                 .iter_mut()
                 .for_each(|encoding| encoding.set_sequence_id(i));
-            encoding.set_type_ids(vec![i as u32; encoding.len()]);
+            // Fill type_ids in-place instead of allocating a new Vec.
+            // For single-sequence with type_id=0, finish_fast already
+            // set the correct values — this is a no-op.
+            {
+                let n = encoding.len();
+                let tid = i as u32;
+                let type_ids = encoding.type_ids_mut();
+                type_ids.resize(n, tid);
+                type_ids.fill(tid);
+            }
         });
 
         let encodings = self.process_encodings(encodings, add_special_tokens)?;
