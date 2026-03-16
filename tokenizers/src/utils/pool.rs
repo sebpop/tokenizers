@@ -3,69 +3,86 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
 
-/// Detect SMT at process init by checking CPU topology.
-/// On Linux: reads thread_siblings_list for CPU 0.
-/// Returns true if the CPU has SMT siblings (e.g., Vera: "0-1").
-/// Returns false if no SMT (e.g., Grace: "0", or non-Linux).
-fn detect_smt() -> bool {
+/// Count physical cores by reading sysfs topology.
+/// Returns (physical_cores, has_smt).
+fn detect_topology() -> (usize, bool) {
     #[cfg(target_os = "linux")]
     {
-        std::fs::read_to_string(
+        let has_smt = std::fs::read_to_string(
             "/sys/devices/system/cpu/cpu0/topology/thread_siblings_list",
         )
         .map(|s| s.trim().contains('-') || s.trim().contains(','))
-        .unwrap_or(false)
+        .unwrap_or(false);
+
+        // Count physical cores from unique core_id values across all CPUs.
+        let physical = if has_smt {
+            // With SMT, physical cores = online CPUs / siblings per core.
+            // Read siblings count from the first core's thread_siblings_list.
+            let siblings = std::fs::read_to_string(
+                "/sys/devices/system/cpu/cpu0/topology/thread_siblings_list",
+            )
+            .ok()
+            .and_then(|s| {
+                let parts: Vec<&str> = s.trim().split(&['-', ','][..]).collect();
+                if parts.len() >= 2 {
+                    let lo: usize = parts[0].parse().ok()?;
+                    let hi: usize = parts[parts.len() - 1].parse().ok()?;
+                    Some(hi - lo + 1)
+                } else {
+                    Some(1)
+                }
+            })
+            .unwrap_or(2);
+            thread::available_parallelism().map(|n| n.get()).unwrap_or(1) / siblings
+        } else {
+            thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+        };
+
+        (physical, has_smt)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        false
+        (thread::available_parallelism().map(|n| n.get()).unwrap_or(1), false)
     }
 }
 
-static HAS_SMT: OnceLock<bool> = OnceLock::new();
+static TOPOLOGY: OnceLock<(usize, bool)> = OnceLock::new();
 
-#[inline(always)]
-fn has_smt() -> bool {
-    *HAS_SMT.get().unwrap_or(&false)
+fn get_topology() -> (usize, bool) {
+    *TOPOLOGY.get_or_init(detect_topology)
 }
 
 /// Spin-wait barrier that stays entirely in userspace.
 ///
-/// Uses ISB (spin_loop) for the fast path, then selects the slow path
-/// based on SMT detection at process init:
+/// Uses ISB (spin_loop) for the fast path.  The slow path depends on
+/// whether the pool is oversubscribed (more threads than physical cores):
 ///
-/// - **No SMT** (Grace, Graviton): pure ISB spin.  No overhead from
-///   WFI or sched_yield.
+/// - **Not oversubscribed** (e.g., 88 threads on 88 physical cores):
+///   pure ISB spin.  No kernel entry, no WFI trap overhead.
 ///
-/// - **SMT** (Vera): WFI in the slow path.  On aarch64 Linux with
-///   SMT (e.g., Vera), the ntwi_yield kernel module is required to
-///   yield execution resources of a shared physical core to the
-///   sibling thread that is not blocked on the spin_loop.  The module
-///   traps WFI from EL0, sets TIF_NEED_RESCHED, and the kernel
-///   return-to-EL0 path calls schedule() to yield to the sibling.
-///   If the kernel module is NOT loaded, WFI executes natively as an
-///   86 ns idle cycle without yielding SMT resources, causing severe
-///   performance degradation at thread counts above the physical core
-///   count.  Measured on Vera (88 physical cores, 176 logical):
-///     - 176t with module:    11.40 GiB/s (full SMT utilization)
-///     - 176t without module:  2.06 GiB/s (5.5x slower, SMT starved)
-///     - 88t (no SMT needed): 11.26 GiB/s (unaffected)
+/// - **Oversubscribed** (e.g., 176 threads on 88 physical cores):
+///   WFI on aarch64 Linux.  The ntwi_yield kernel module traps WFI
+///   from EL0, sets TIF_NEED_RESCHED, and yields to the SMT sibling.
+///   Without the module, WFI is a ~86ns idle cycle that does NOT yield.
 ///
-/// - **x86_64 / macOS**: `core::hint::spin_loop()` which emits
-///   `pause` (x86) or `isb` (aarch64-mac).
+/// - **x86_64 / macOS**: `core::hint::spin_loop()` (pause / isb).
 #[repr(align(128))]
 struct SpinBarrier {
     count: AtomicUsize,
     generation: AtomicUsize,
     total: usize,
+    /// True when pool threads > physical cores (SMT oversubscribed).
+    use_wfi: bool,
 }
 
 impl SpinBarrier {
     fn new(total: usize) -> Self {
+        let (physical_cores, has_smt) = get_topology();
         Self {
             count: AtomicUsize::new(0),
             generation: AtomicUsize::new(0),
             total,
+            use_wfi: has_smt && total > physical_cores,
         }
     }
 
@@ -73,7 +90,6 @@ impl SpinBarrier {
     fn wait(&self) {
         let gen = self.generation.load(Ordering::Relaxed);
         if self.count.fetch_add(1, Ordering::AcqRel) == self.total - 1 {
-            // Last thread to arrive: reset count and bump generation.
             self.count.store(0, Ordering::Relaxed);
             self.generation.store(gen.wrapping_add(1), Ordering::Release);
         } else {
@@ -82,7 +98,7 @@ impl SpinBarrier {
                 if spins < 64 {
                     core::hint::spin_loop();
                     spins += 1;
-                } else if has_smt() {
+                } else if self.use_wfi {
                     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
                     unsafe {
                         core::arch::asm!("wfi", options(nomem, nostack));
@@ -132,7 +148,8 @@ pub struct WorkPool {
 impl WorkPool {
     pub fn new(num_threads: usize) -> Self {
         assert!(num_threads > 0);
-        HAS_SMT.get_or_init(detect_smt);
+        // Ensure topology is detected before constructing barriers.
+        TOPOLOGY.get_or_init(detect_topology);
 
         let inner = Arc::new(Inner {
             start: SpinBarrier::new(num_threads + 1),
@@ -266,8 +283,9 @@ mod tests {
     }
 
     #[test]
-    fn test_smt_detection() {
-        let result = detect_smt();
-        println!("SMT detected: {result}");
+    fn test_topology_detection() {
+        let (physical, has_smt) = detect_topology();
+        println!("physical_cores: {physical}, has_smt: {has_smt}");
+        assert!(physical > 0);
     }
 }
