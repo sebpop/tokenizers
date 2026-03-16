@@ -32,7 +32,7 @@ impl Serialize for BPE {
         merges.sort_unstable_by_key(|k| k.1);
         let merges = merges
             .into_iter()
-            .map(|(pair, _)| (self.vocab_r[&pair.0].clone(), self.vocab_r[&pair.1].clone()))
+            .map(|(pair, _)| (self.vocab_r_vec[pair.0 as usize].clone(), self.vocab_r_vec[pair.1 as usize].clone()))
             .collect::<Vec<_>>();
         let ordered_vocab = OrderedVocabIter::new(&self.vocab_r);
 

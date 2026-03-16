@@ -223,12 +223,17 @@ impl BpeBuilder {
             self.config.merges = m;
         }
 
-        let vocab_r = self
+        let vocab_r: VocabR = self
             .config
             .vocab
             .iter()
             .map(|(key, val)| (*val, key.to_owned()))
             .collect();
+        let max_id = vocab_r.keys().max().copied().unwrap_or(0) as usize;
+        let mut vocab_r_vec = vec![String::new(); max_id + 1];
+        for (&id, token) in &vocab_r {
+            vocab_r_vec[id as usize] = token.clone();
+        }
         let cache = match self.config.cache_capacity {
             0 => None,
             capacity => Some(Cache::new(capacity)),
@@ -266,6 +271,7 @@ impl BpeBuilder {
         Ok(BPE {
             vocab,
             vocab_r,
+            vocab_r_vec,
             merges: merge_map,
             cache,
             dropout: self.config.dropout,
@@ -286,6 +292,9 @@ pub struct BPE {
     pub(crate) vocab: Vocab,
     /// Reversed vocabulary, to rebuild sentences.
     pub(crate) vocab_r: VocabR,
+    /// Flat reverse vocabulary indexed by token ID for O(1) decode lookups.
+    /// Empty string at index i means no token with that ID exists.
+    pub(crate) vocab_r_vec: Vec<String>,
     /// Contains the mapping between Pairs and their (rank, new_id).
     pub(crate) merges: MergeMap,
     /// Contains the cache for optimizing the encoding step.
@@ -338,6 +347,7 @@ impl Clone for BPE {
         Self {
             vocab: self.vocab.clone(),
             vocab_r: self.vocab_r.clone(),
+            vocab_r_vec: self.vocab_r_vec.clone(),
             merges: self.merges.clone(),
             cache: fresh_cache,
             dropout: self.dropout,
@@ -539,7 +549,7 @@ impl BPE {
     fn word_to_tokens<'a>(&'a self, word: &'a Word) -> impl Iterator<Item = Token> + 'a {
         word.get_chars_iter()
             .zip(word.get_offsets_iter())
-            .map(move |(id, offsets)| Token::new(id, self.vocab_r[&id].clone(), offsets))
+            .map(move |(id, offsets)| Token::new(id, self.vocab_r_vec[id as usize].clone(), offsets))
     }
 
     /// Like `word_to_tokens` but uses empty Strings, avoiding
@@ -773,11 +783,17 @@ impl Model for BPE {
     }
 
     fn id_to_token(&self, id: u32) -> Option<String> {
-        self.vocab_r.get(&id).cloned()
+        self.vocab_r_vec
+            .get(id as usize)
+            .filter(|s| !s.is_empty())
+            .cloned()
     }
 
     fn id_to_token_ref(&self, id: u32) -> Option<&str> {
-        self.vocab_r.get(&id).map(|s| s.as_str())
+        self.vocab_r_vec
+            .get(id as usize)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.as_str())
     }
 
     fn save(&self, folder: &Path, name: Option<&str>) -> Result<Vec<PathBuf>> {
@@ -816,7 +832,7 @@ impl Model for BPE {
             &merges
                 .into_iter()
                 .flat_map(|(pair, _)| {
-                    format!("{} {}\n", self.vocab_r[&pair.0], self.vocab_r[&pair.1]).into_bytes()
+                    format!("{} {}\n", self.vocab_r_vec[pair.0 as usize], self.vocab_r_vec[pair.1 as usize]).into_bytes()
                 })
                 .collect::<Vec<_>>()[..],
         )?;

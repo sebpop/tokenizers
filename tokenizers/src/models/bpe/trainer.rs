@@ -617,6 +617,11 @@ impl BpeTrainer {
             .iter()
             .map(|(key, val)| (*val, key.to_owned()))
             .collect();
+        let max_id = model.vocab_r.keys().max().copied().unwrap_or(0) as usize;
+        model.vocab_r_vec = vec![String::new(); max_id + 1];
+        for (&id, token) in &model.vocab_r {
+            model.vocab_r_vec[id as usize] = token.clone();
+        }
         model.merges = super::MergeMap::from_iter(
             merges
                 .into_iter()
