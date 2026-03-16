@@ -498,8 +498,19 @@ impl BPE {
     }
 
     fn merge_word(&self, w: &str) -> Result<Word> {
+        // Thread-local Word: clear()+reuse retains Vec<Symbol>
+        // capacity from previous segments, eliminating per-segment
+        // allocation after the first BPE cache miss.
+        thread_local! {
+            static REUSE_WORD: std::cell::RefCell<Word> =
+                std::cell::RefCell::new(Word::new());
+        }
+        let mut word = REUSE_WORD.with(|cell| {
+            let mut w = cell.borrow_mut();
+            w.clear();
+            std::mem::take(&mut *w)
+        });
         let mut indices = w.char_indices().map(|(idx, _)| idx).peekable();
-        let mut word = Word::with_capacity(w.len());
         let mut unk: Option<(u32, usize)> = None;
         while let Some(i) = indices.next() {
             let end = indices.peek();

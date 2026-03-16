@@ -173,31 +173,37 @@ pub trait PostProcessor {
         pair_encoding: Option<Encoding>,
         add_special_tokens: bool,
     ) -> Result<Encoding> {
-        let mut encodings = if let Some(pair_encoding) = pair_encoding {
-            vec![encoding, pair_encoding]
-        } else {
-            vec![encoding]
-        };
-        encodings.iter_mut().enumerate().for_each(|(i, encoding)| {
-            encoding.set_sequence_id(i);
-            encoding
-                .get_overflowing_mut()
-                .iter_mut()
-                .for_each(|encoding| encoding.set_sequence_id(i));
-            // Fill type_ids in-place instead of allocating a new Vec.
-            // For single-sequence with type_id=0, finish_fast already
-            // set the correct values — this is a no-op.
-            {
+        // Thread-local Vec avoids per-call allocation for the
+        // encodings wrapper (1-2 elements).
+        thread_local! {
+            static ENCODINGS: std::cell::RefCell<Vec<Encoding>> =
+                std::cell::RefCell::new(Vec::with_capacity(2));
+        }
+        ENCODINGS.with(|cell| {
+            let mut encodings = cell.borrow_mut();
+            encodings.clear();
+            encodings.push(encoding);
+            if let Some(pair_encoding) = pair_encoding {
+                encodings.push(pair_encoding);
+            }
+            encodings.iter_mut().enumerate().for_each(|(i, encoding)| {
+                encoding.set_sequence_id(i);
+                encoding
+                    .get_overflowing_mut()
+                    .iter_mut()
+                    .for_each(|encoding| encoding.set_sequence_id(i));
                 let n = encoding.len();
                 let tid = i as u32;
                 let type_ids = encoding.type_ids_mut();
                 type_ids.resize(n, tid);
                 type_ids.fill(tid);
-            }
-        });
+            });
 
-        let encodings = self.process_encodings(encodings, add_special_tokens)?;
-        Ok(Encoding::merge(encodings, false))
+            // Take ownership from the thread-local for process_encodings.
+            let owned = std::mem::take(&mut *encodings);
+            let result = self.process_encodings(owned, add_special_tokens)?;
+            Ok(Encoding::merge(result, false))
+        })
     }
 
     /// Process any amount of encodings and returns a series of encoding (might merge them)

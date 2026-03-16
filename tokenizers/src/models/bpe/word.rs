@@ -85,6 +85,12 @@ impl Word {
         }
     }
 
+    /// Clear symbols but retain Vec capacity for reuse.
+    #[allow(dead_code)]
+    pub(super) fn clear(&mut self) {
+        self.symbols.clear();
+    }
+
     pub(super) fn add(&mut self, c: u32, byte_len: usize) {
         let (prev, next) = {
             let len = self.symbols.len() as isize;
