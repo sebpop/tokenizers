@@ -129,39 +129,52 @@ impl ByteLevel {
     where
         F: Fn(&str, &mut Vec<u32>) -> Result<()>,
     {
-        // Thread-local buffers: clear()+reuse retains capacity from
-        // previous documents, eliminating per-document allocations
-        // after the first call.  (Nathan Tuck: "zero allocate".)
+        // Thread-local workspace: clear()+reuse retains capacity,
+        // eliminating per-document allocations after warmup.
+        // Uses UnsafeCell (no RefCell borrow check overhead) since
+        // encode_ids_fast is not reentrant on a single thread.
+        struct Workspace {
+            buf: String,
+            seg_starts: Vec<u32>,
+            encoding: Option<Encoding>,
+        }
         thread_local! {
-            static BUF: std::cell::RefCell<String> = std::cell::RefCell::new(String::new());
-            static SEG_STARTS: std::cell::RefCell<Vec<u32>> = std::cell::RefCell::new(Vec::new());
+            static WS: std::cell::UnsafeCell<Workspace> =
+                std::cell::UnsafeCell::new(Workspace {
+                    buf: String::new(),
+                    seg_starts: Vec::new(),
+                    encoding: None,
+                });
         }
 
         let table = &*BYTES_CHAR_TABLE;
         let re_ref: &SysRegex = &RE;
 
-        BUF.with(|buf_cell| {
-        SEG_STARTS.with(|segs_cell| {
-            let mut buf = buf_cell.borrow_mut();
-            let mut seg_starts = segs_cell.borrow_mut();
-            buf.clear();
-            seg_starts.clear();
+        // Safety: encode_ids_fast is called from a single thread's
+        // work closure and does not recurse, so the mutable borrow
+        // through UnsafeCell is exclusive.
+        WS.with(|ws_cell| {
+            let ws = unsafe { &mut *ws_cell.get() };
+            ws.buf.clear();
+            ws.seg_starts.clear();
 
             for (match_start, match_end) in re_ref.find_iter(text) {
-                seg_starts.push(buf.len() as u32);
+                ws.seg_starts.push(ws.buf.len() as u32);
                 let segment = &text[match_start..match_end];
                 for byte in segment.as_bytes() {
-                    buf.push(table[*byte as usize]);
+                    ws.buf.push(table[*byte as usize]);
                 }
             }
-            seg_starts.push(buf.len() as u32);
+            ws.seg_starts.push(ws.buf.len() as u32);
 
-            let n_segs = seg_starts.len() - 1;
-            let mut encoding = Encoding::pooled_or_with_capacity(n_segs * 2);
+            let n_segs = ws.seg_starts.len() - 1;
+            // Thread-local Encoding avoids the global Mutex pool.
+            let mut encoding = ws.encoding.take().unwrap_or_else(|| Encoding::with_capacity(n_segs * 2));
+            encoding.clear();
             for i in 0..n_segs {
-                let start = seg_starts[i] as usize;
-                let end = seg_starts[i + 1] as usize;
-                let segment = &buf[start..end];
+                let start = ws.seg_starts[i] as usize;
+                let end = ws.seg_starts[i + 1] as usize;
+                let segment = &ws.buf[start..end];
                 if !segment.is_empty() {
                     tokenize_ids_into(segment, encoding.ids_mut())?;
                 }
@@ -170,7 +183,6 @@ impl ByteLevel {
             encoding.type_ids_mut().resize(n_ids, type_id);
             encoding.finish_fast();
             Ok(encoding)
-        })
         })
     }
 
