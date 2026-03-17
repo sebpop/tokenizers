@@ -78,11 +78,15 @@ struct SpinBarrier {
 impl SpinBarrier {
     fn new(total: usize) -> Self {
         let (physical_cores, has_smt) = get_topology();
+        // total includes the caller thread (+1).  SMT oversubscription
+        // happens when worker threads exceed physical cores, so subtract
+        // the caller from the comparison.
+        let workers = total.saturating_sub(1);
         Self {
             count: AtomicUsize::new(0),
             generation: AtomicUsize::new(0),
             total,
-            use_wfi: has_smt && total > physical_cores,
+            use_wfi: has_smt && workers > physical_cores,
         }
     }
 
