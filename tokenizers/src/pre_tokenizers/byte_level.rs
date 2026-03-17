@@ -114,12 +114,13 @@ impl ByteLevel {
         BYTES_CHAR_TABLE.iter().copied().filter(|c| *c != '\0').collect()
     }
 
-    /// Fused regex + byte-level encode + tokenize pipeline for the fast
-    /// path.  Produces token IDs directly from the input text without
-    /// creating ~2000 separate NormalizedString/Split heap objects.
+    /// Fused regex + tokenize pipeline for the fast path.  Produces token
+    /// IDs directly from the input text without creating ~2000 separate
+    /// NormalizedString/Split heap objects.
     ///
-    /// All byte-level encoded segments are written into a single contiguous
-    /// String buffer; BPE receives `&str` slices into that buffer.
+    /// Raw regex-matched segments are passed directly to the tokenizer
+    /// closure (which uses `byte_to_initial_token` to map bytes to token
+    /// IDs), eliminating the per-byte char-encoding roundtrip.
     pub fn encode_ids_fast<F>(
         &self,
         text: &str,
@@ -129,25 +130,16 @@ impl ByteLevel {
     where
         F: Fn(&str, &mut Vec<u32>) -> Result<()>,
     {
-        // Thread-local workspace: clear()+reuse retains capacity,
-        // eliminating per-document allocations after warmup.
-        // Uses UnsafeCell (no RefCell borrow check overhead) since
-        // encode_ids_fast is not reentrant on a single thread.
         struct Workspace {
-            buf: String,
-            seg_starts: Vec<u32>,
             encoding: Option<Encoding>,
         }
         thread_local! {
             static WS: std::cell::UnsafeCell<Workspace> =
                 std::cell::UnsafeCell::new(Workspace {
-                    buf: String::new(),
-                    seg_starts: Vec::new(),
                     encoding: None,
                 });
         }
 
-        let table = &*BYTES_CHAR_TABLE;
         let re_ref: &SysRegex = &RE;
 
         // Safety: encode_ids_fast is called from a single thread's
@@ -155,26 +147,10 @@ impl ByteLevel {
         // through UnsafeCell is exclusive.
         WS.with(|ws_cell| {
             let ws = unsafe { &mut *ws_cell.get() };
-            ws.buf.clear();
-            ws.seg_starts.clear();
-
-            for (match_start, match_end) in re_ref.find_iter(text) {
-                ws.seg_starts.push(ws.buf.len() as u32);
-                let segment = &text[match_start..match_end];
-                for byte in segment.as_bytes() {
-                    ws.buf.push(table[*byte as usize]);
-                }
-            }
-            ws.seg_starts.push(ws.buf.len() as u32);
-
-            let n_segs = ws.seg_starts.len() - 1;
-            // Thread-local Encoding avoids the global Mutex pool.
-            let mut encoding = ws.encoding.take().unwrap_or_else(|| Encoding::with_capacity(n_segs * 2));
+            let mut encoding = ws.encoding.take().unwrap_or_else(|| Encoding::with_capacity(64));
             encoding.clear();
-            for i in 0..n_segs {
-                let start = ws.seg_starts[i] as usize;
-                let end = ws.seg_starts[i + 1] as usize;
-                let segment = &ws.buf[start..end];
+            for (match_start, match_end) in re_ref.find_iter(text) {
+                let segment = &text[match_start..match_end];
                 if !segment.is_empty() {
                     tokenize_ids_into(segment, encoding.ids_mut())?;
                 }

@@ -169,6 +169,21 @@ impl Model for ModelWrapper {
         }
     }
 
+    fn tokenize_ids_into_fused(&self, raw: &str, out: &mut Vec<u32>) -> Result<()> {
+        match self {
+            Self::BPE(t) => t.tokenize_ids_into_fused(raw, out),
+            _ => {
+                use crate::pre_tokenizers::byte_level::BYTES_CHAR_TABLE;
+                let table = &*BYTES_CHAR_TABLE;
+                let mut encoded = String::with_capacity(raw.len() * 2);
+                for &b in raw.as_bytes() {
+                    encoded.push(table[b as usize]);
+                }
+                self.tokenize_ids_into(&encoded, out)
+            }
+        }
+    }
+
     fn token_to_id(&self, token: &str) -> Option<u32> {
         match self {
             Self::WordLevel(t) => t.token_to_id(token),
@@ -200,6 +215,13 @@ impl Model for ModelWrapper {
         match self {
             Self::BPE(t) => t.id_to_decoded_bytes(id),
             _ => None,
+        }
+    }
+
+    fn estimate_decode_capacity(&self, n: usize) -> usize {
+        match self {
+            Self::BPE(t) => t.estimate_decode_capacity(n),
+            _ => 0,
         }
     }
 

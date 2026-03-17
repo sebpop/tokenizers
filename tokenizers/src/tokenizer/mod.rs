@@ -114,6 +114,20 @@ pub trait Model {
         Ok(())
     }
 
+    /// Tokenize raw (pre-ByteLevel-encoded) text directly, mapping bytes
+    /// to initial token IDs via a pre-computed table.  Used by the fused
+    /// encode_ids_fast path.  Default applies byte-level char encoding and
+    /// falls back to `tokenize_ids_into`.
+    fn tokenize_ids_into_fused(&self, raw: &str, out: &mut Vec<u32>) -> Result<()> {
+        use crate::pre_tokenizers::byte_level::BYTES_CHAR_TABLE;
+        let table = &*BYTES_CHAR_TABLE;
+        let mut encoded = String::with_capacity(raw.len() * 2);
+        for &b in raw.as_bytes() {
+            encoded.push(table[b as usize]);
+        }
+        self.tokenize_ids_into(&encoded, out)
+    }
+
     /// Flush any per-thread cache buffer into the shared cache. No-op for models without a cache.
     fn flush_cache(&self) {}
 
@@ -158,6 +172,12 @@ pub trait Model {
     /// Default returns `None`; BPE overrides with its pre-computed table.
     fn id_to_decoded_bytes(&self, _id: u32) -> Option<&[u8]> {
         None
+    }
+
+    /// Estimate output buffer capacity for decoding `n` tokens.
+    /// Returns 0 if the model does not support capacity estimation.
+    fn estimate_decode_capacity(&self, _n: usize) -> usize {
+        0
     }
 }
 
@@ -819,7 +839,7 @@ where
                     if let Some(bl) = pt.as_byte_level() {
                         return bl.encode_ids_fast(
                             seq.as_ref(),
-                            |segment, out| self.model.tokenize_ids_into(segment, out),
+                            |segment, out| self.model.tokenize_ids_into_fused(segment, out),
                             type_id,
                         );
                     }
@@ -1043,51 +1063,52 @@ where
         self.decoder.as_ref()?;
         let added = self.added_vocabulary.get_added_tokens_decoder();
 
-        // Determine whether per-token added-vocab check is needed.
-        // When all added-vocab IDs are above the max input ID, skip
-        // the HashMap probe entirely (common case for normal text).
         let min_added_id = added.keys().min().copied().unwrap_or(u32::MAX);
         let max_input_id = ids.iter().max().copied().unwrap_or(0);
         let check_added = !added.is_empty() && max_input_id >= min_added_id;
 
-        // Pre-compute exact output size.
-        let mut total_len: usize = 0;
-        for &id in ids {
-            if check_added {
-                if let Some(tok) = added.get(&id) {
-                    if skip_special_tokens && self.added_vocabulary.is_special_token(&tok.content) {
-                        continue;
-                    }
-                    total_len += tok.content.len();
-                    continue;
-                }
-            }
-            total_len += self.model.id_to_decoded_bytes(id)?.len();
-        }
+        // Single pass: estimate capacity from average bytes/token, then
+        // write directly.  Vec geometric growth handles underestimates.
+        let cap = self.model.estimate_decode_capacity(ids.len());
+        let mut buf = Vec::with_capacity(if cap > 0 { cap } else { ids.len() * 4 });
 
-        let mut buf = Vec::with_capacity(total_len);
-        for &id in ids {
+        let n = ids.len();
+        let mut i = 0;
+        while i < n {
+            let id = ids[i];
             if check_added {
                 if let Some(tok) = added.get(&id) {
-                    if skip_special_tokens && self.added_vocabulary.is_special_token(&tok.content) {
-                        continue;
+                    if !(skip_special_tokens && self.added_vocabulary.is_special_token(&tok.content)) {
+                        buf.extend_from_slice(tok.content.as_bytes());
                     }
-                    buf.extend_from_slice(tok.content.as_bytes());
+                    i += 1;
                     continue;
                 }
             }
-            // Safety: the size-computation pass above verified every
-            // non-added ID has pre-decoded bytes.
-            let bytes = unsafe { self.model.id_to_decoded_bytes(id).unwrap_unchecked() };
+            let bytes = self.model.id_to_decoded_bytes(id)?;
+
+            // Prefetch decoded bytes for a token 4 ahead to hide memory
+            // latency in the flat vocab_decoded buffer.
+            #[cfg(target_arch = "aarch64")]
+            if i + 4 < n {
+                if let Some(future) = self.model.id_to_decoded_bytes(ids[i + 4]) {
+                    unsafe {
+                        core::arch::asm!(
+                            "prfm pldl1keep, [{addr}]",
+                            addr = in(reg) future.as_ptr(),
+                            options(readonly, nostack)
+                        );
+                    }
+                }
+            }
+
             buf.extend_from_slice(bytes);
+            i += 1;
         }
 
         // Safety: all bytes come from vocab_decoded (built from valid token
         // strings via build_vocab_decoded) or from added-vocab tok.content
-        // (a valid String).  When the token IDs originated from encoding
-        // valid UTF-8 text, the concatenated decoded bytes are valid UTF-8.
-        // Invalid IDs (truncated multi-byte sequences) would produce invalid
-        // UTF-8, but this matches the existing unsafe unwrap_unchecked above.
+        // (a valid String).
         Some(Ok(unsafe { String::from_utf8_unchecked(buf) }))
     }
 

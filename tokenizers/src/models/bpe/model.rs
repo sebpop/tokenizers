@@ -1,5 +1,5 @@
 use super::{super::OrderedVocabIter, trainer::BpeTrainer, Error, Pair, Word};
-use crate::pre_tokenizers::byte_level::CHAR_BYTES_TABLE;
+use crate::pre_tokenizers::byte_level::{BYTES_CHAR_TABLE, CHAR_BYTES_TABLE};
 use crate::tokenizer::{Model, Result, Token};
 use crate::utils::cache::{Cache, DEFAULT_CACHE_CAPACITY, MAX_LENGTH};
 use crate::utils::iter::ResultShunt;
@@ -16,35 +16,85 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// Pre-compute ByteLevel-decoded bytes for each entry in vocab_r_vec.
-/// For each token string, map chars through CHAR_BYTES_TABLE to get
-/// the raw bytes that ByteLevel::decode_chain would produce.
-pub(crate) fn build_vocab_decoded(vocab_r_vec: &[String]) -> Vec<Vec<u8>> {
+/// Flat contiguous storage for pre-decoded vocabulary bytes.
+///
+/// Instead of `Vec<Vec<u8>>` (one heap allocation per token, pointer chasing
+/// on every lookup), all decoded bytes are concatenated into a single buffer
+/// with an offset table for O(1) slicing.  For GPT-2 (~50K tokens, ~4 bytes
+/// avg), the flat layout is ~400KB (fits in L2) vs ~2.2MB scattered across
+/// heap with the nested-Vec layout.
+#[derive(Clone, PartialEq)]
+pub(crate) struct FlatVocabDecoded {
+    /// All tokens' decoded bytes concatenated end-to-end.
+    bytes: Vec<u8>,
+    /// `offsets[id]..offsets[id+1]` is the byte range for token `id`.
+    /// Length = vocab_size + 1 (sentinel entry at the end).
+    offsets: Vec<u32>,
+    /// Average decoded bytes per non-empty token, scaled by 256 for
+    /// fixed-point arithmetic.  Used for single-pass capacity estimate.
+    avg_bytes_x256: u32,
+}
+
+impl FlatVocabDecoded {
+    /// Look up the pre-decoded bytes for a token ID.
+    /// Returns `None` if the ID is out of range or the token has no decoded bytes.
+    #[inline]
+    pub(crate) fn get(&self, id: u32) -> Option<&[u8]> {
+        let idx = id as usize;
+        if idx + 1 >= self.offsets.len() {
+            return None;
+        }
+        let start = self.offsets[idx] as usize;
+        let end = self.offsets[idx + 1] as usize;
+        if start == end {
+            return None;
+        }
+        Some(&self.bytes[start..end])
+    }
+
+    /// Estimate output buffer capacity for `n` tokens based on average
+    /// bytes per token.  Adds ~10% headroom to avoid reallocation.
+    #[inline]
+    pub(crate) fn estimate_capacity(&self, n: usize) -> usize {
+        ((n as u64 * self.avg_bytes_x256 as u64 * 11) / (256 * 10)) as usize
+    }
+}
+
+/// Pre-compute ByteLevel-decoded bytes for each entry in vocab_r_vec
+/// and pack them into a flat contiguous buffer.
+pub(crate) fn build_vocab_decoded(vocab_r_vec: &[String]) -> FlatVocabDecoded {
     let table = &*CHAR_BYTES_TABLE;
-    vocab_r_vec
-        .iter()
-        .map(|token| {
-            if token.is_empty() {
-                return Vec::new();
+
+    let mut bytes = Vec::with_capacity(vocab_r_vec.len() * 4);
+    let mut offsets = Vec::with_capacity(vocab_r_vec.len() + 1);
+
+    for token in vocab_r_vec {
+        offsets.push(bytes.len() as u32);
+        if token.is_empty() {
+            continue;
+        }
+        let start = bytes.len();
+        let mut all_mapped = true;
+        for c in token.chars() {
+            let idx = c as usize;
+            if let Some(&Some(b)) = table.get(idx) {
+                bytes.push(b);
+            } else {
+                all_mapped = false;
+                break;
             }
-            let mut bytes = Vec::with_capacity(token.len());
-            let mut all_mapped = true;
-            for c in token.chars() {
-                let idx = c as usize;
-                if let Some(&Some(b)) = table.get(idx) {
-                    bytes.push(b);
-                } else {
-                    all_mapped = false;
-                    break;
-                }
-            }
-            if !all_mapped {
-                bytes.clear();
-                bytes.extend_from_slice(token.as_bytes());
-            }
-            bytes
-        })
-        .collect()
+        }
+        if !all_mapped {
+            bytes.truncate(start);
+            bytes.extend_from_slice(token.as_bytes());
+        }
+    }
+    offsets.push(bytes.len() as u32);
+
+    let non_empty = vocab_r_vec.iter().filter(|t| !t.is_empty()).count().max(1);
+    let avg_bytes_x256 = ((bytes.len() as u64 * 256) / non_empty as u64) as u32;
+
+    FlatVocabDecoded { bytes, offsets, avg_bytes_x256 }
 }
 
 /// Per-thread BPE cache state: a write buffer for batching inserts into the
@@ -299,7 +349,16 @@ impl BpeBuilder {
             .collect::<Result<Vec<_>>>()?;
         let merge_map = MergeMap::from_iter(merge_pairs.into_iter());
 
-        // merges.insert(pair, (rank as u32, *new_id));
+        let mut byte_to_initial_token = [u32::MAX; 256];
+        let bytes_char_table = &*BYTES_CHAR_TABLE;
+        for byte_val in 0u16..256 {
+            let ch = bytes_char_table[byte_val as usize];
+            let mut buf = [0u8; 4];
+            let s = ch.encode_utf8(&mut buf);
+            if let Some(&id) = vocab.get(s) {
+                byte_to_initial_token[byte_val as usize] = id;
+            }
+        }
 
         Ok(BPE {
             vocab,
@@ -315,6 +374,7 @@ impl BpeBuilder {
             fuse_unk: self.config.fuse_unk,
             byte_fallback: self.config.byte_fallback,
             ignore_merges: self.config.ignore_merges,
+            byte_to_initial_token,
         })
     }
 }
@@ -330,8 +390,8 @@ pub struct BPE {
     /// Empty string at index i means no token with that ID exists.
     pub(crate) vocab_r_vec: Vec<String>,
     /// Pre-decoded bytes for each token ID (ByteLevel char→byte applied).
-    /// Built at construction time so decode skips per-char table lookups.
-    pub(crate) vocab_decoded: Vec<Vec<u8>>,
+    /// Flat contiguous storage — eliminates pointer chasing on decode.
+    pub(crate) vocab_decoded: FlatVocabDecoded,
     /// Contains the mapping between Pairs and their (rank, new_id).
     pub(crate) merges: MergeMap,
     /// Contains the cache for optimizing the encoding step.
@@ -352,6 +412,10 @@ pub struct BPE {
     pub byte_fallback: bool,
     /// Whether or not to direct output words if they are part of the vocab.
     pub ignore_merges: bool,
+    /// Pre-computed byte → initial token ID table for the fused byte-level
+    /// BPE path.  Eliminates per-byte vocab hash lookups.  `u32::MAX` means
+    /// the byte has no mapping (should not happen for byte-level vocabs).
+    byte_to_initial_token: [u32; 256],
 }
 
 impl std::fmt::Debug for BPE {
@@ -395,6 +459,7 @@ impl Clone for BPE {
             fuse_unk: self.fuse_unk,
             byte_fallback: self.byte_fallback,
             ignore_merges: self.ignore_merges,
+            byte_to_initial_token: self.byte_to_initial_token,
         }
     }
 }
@@ -498,19 +563,8 @@ impl BPE {
     }
 
     fn merge_word(&self, w: &str) -> Result<Word> {
-        // Thread-local Word: clear()+reuse retains Vec<Symbol>
-        // capacity from previous segments, eliminating per-segment
-        // allocation after the first BPE cache miss.
-        thread_local! {
-            static REUSE_WORD: std::cell::RefCell<Word> =
-                std::cell::RefCell::new(Word::new());
-        }
-        let mut word = REUSE_WORD.with(|cell| {
-            let mut w = cell.borrow_mut();
-            w.clear();
-            std::mem::take(&mut *w)
-        });
         let mut indices = w.char_indices().map(|(idx, _)| idx).peekable();
+        let mut word = Word::with_capacity(w.len());
         let mut unk: Option<(u32, usize)> = None;
         while let Some(i) = indices.next() {
             let end = indices.peek();
@@ -592,6 +646,24 @@ impl BPE {
 
         word.merge_all(&self.merges, self.dropout);
 
+        Ok(word)
+    }
+
+    /// Fused byte-level merge: map raw bytes directly to initial token IDs
+    /// via `byte_to_initial_token`, skipping the char-encoding roundtrip.
+    fn merge_word_fused(&self, raw: &str) -> Result<Word> {
+        let bytes = raw.as_bytes();
+        let mut word = Word::with_capacity(bytes.len());
+        for &b in bytes {
+            let id = self.byte_to_initial_token[b as usize];
+            if id == u32::MAX {
+                return Err(
+                    format!("byte 0x{b:02x} has no byte-level token mapping").into(),
+                );
+            }
+            word.add(id, 1);
+        }
+        word.merge_all(&self.merges, self.dropout);
         Ok(word)
     }
 
@@ -827,6 +899,42 @@ impl Model for BPE {
         })
     }
 
+    fn tokenize_ids_into_fused(&self, raw: &str, out: &mut Vec<u32>) -> Result<()> {
+        if raw.is_empty() {
+            return Ok(());
+        }
+        if self.dropout.is_some() && self.dropout != Some(0.0) {
+            let word = self.merge_word_fused(raw)?;
+            out.extend(word.get_chars_iter());
+            return Ok(());
+        }
+        BPE_LOCAL.with(|cell| {
+            let mut local = cell.borrow_mut();
+            if let Some(ref hit) = local.read_cache.get(raw) {
+                out.extend(hit.get_chars_iter());
+                return Ok(());
+            }
+            if let Some(ref hit) = local.write_buf.get(raw) {
+                out.extend(hit.get_chars_iter());
+                return Ok(());
+            }
+            let word = self.merge_word_fused(raw)?;
+            out.extend(word.get_chars_iter());
+            if raw.len() < MAX_LENGTH {
+                let cap = self
+                    .cache
+                    .as_ref()
+                    .map(|c| c.capacity)
+                    .unwrap_or(DEFAULT_CACHE_CAPACITY);
+                if local.read_cache.len() >= cap {
+                    local.read_cache.clear();
+                }
+                local.read_cache.insert(raw.to_owned(), word);
+            }
+            Ok(())
+        })
+    }
+
     fn token_to_id(&self, token: &str) -> Option<u32> {
         self.vocab.get(token).copied()
     }
@@ -846,10 +954,11 @@ impl Model for BPE {
     }
 
     fn id_to_decoded_bytes(&self, id: u32) -> Option<&[u8]> {
-        self.vocab_decoded
-            .get(id as usize)
-            .filter(|b| !b.is_empty())
-            .map(|b| b.as_slice())
+        self.vocab_decoded.get(id)
+    }
+
+    fn estimate_decode_capacity(&self, n: usize) -> usize {
+        self.vocab_decoded.estimate_capacity(n)
     }
 
     fn save(&self, folder: &Path, name: Option<&str>) -> Result<Vec<PathBuf>> {
