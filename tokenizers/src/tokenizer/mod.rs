@@ -173,7 +173,6 @@ pub trait PostProcessor {
         pair_encoding: Option<Encoding>,
         add_special_tokens: bool,
     ) -> Result<Encoding> {
-        // Stack-allocate the encodings wrapper (1-2 elements).
         let mut encodings = if let Some(pair_encoding) = pair_encoding {
             vec![encoding, pair_encoding]
         } else {
@@ -185,11 +184,7 @@ pub trait PostProcessor {
                 .get_overflowing_mut()
                 .iter_mut()
                 .for_each(|encoding| encoding.set_sequence_id(i));
-            let n = encoding.len();
-            let tid = i as u32;
-            let type_ids = encoding.type_ids_mut();
-            type_ids.resize(n, tid);
-            type_ids.fill(tid);
+            encoding.set_type_ids(vec![i as u32; encoding.len()]);
         });
 
         let encodings = self.process_encodings(encodings, add_special_tokens)?;
@@ -1087,10 +1082,13 @@ where
             buf.extend_from_slice(bytes);
         }
 
-        Some(Ok(match String::from_utf8(buf) {
-            Ok(s) => s,
-            Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
-        }))
+        // Safety: all bytes come from vocab_decoded (built from valid token
+        // strings via build_vocab_decoded) or from added-vocab tok.content
+        // (a valid String).  When the token IDs originated from encoding
+        // valid UTF-8 text, the concatenated decoded bytes are valid UTF-8.
+        // Invalid IDs (truncated multi-byte sequences) would produce invalid
+        // UTF-8, but this matches the existing unsafe unwrap_unchecked above.
+        Some(Ok(unsafe { String::from_utf8_unchecked(buf) }))
     }
 
     /// Decode the given ids, back to a String
