@@ -1546,6 +1546,20 @@ where
     where
         E: Into<EncodeInput<'s>> + Send,
     {
+        // Specialized path: when pre-tokenizer is ByteLevel, hoist the
+        // invariant checks out of the per-document loop.  Eliminates 4
+        // nested conditionals per document (OffsetType, InputSequence
+        // variant, Option<PreTokenizer>, as_byte_level dynamic dispatch).
+        if let Some(ref pt) = self.pre_tokenizer {
+            if let Some(bl) = pt.as_byte_level() {
+                let mut encodings = self.run_batch_fast_raw(inputs, bl, add_special_tokens)?;
+                if let Some(params) = &self.padding {
+                    pad_encodings(&mut encodings, params)?;
+                }
+                return Ok(encodings);
+            }
+        }
+
         let mut encodings = self.run_batch(inputs, |this, input| {
             this.encode_fast(input, add_special_tokens)
         })?;
@@ -1555,6 +1569,93 @@ where
         }
 
         Ok(encodings)
+    }
+
+    /// Specialized batch encode for ByteLevel + Raw inputs.  Calls
+    /// `bl.encode_ids_fast()` directly, bypassing `encode_fast` →
+    /// `encode_single_sequence` and their per-document dispatch overhead.
+    fn run_batch_fast_raw<'s, E>(
+        &self,
+        inputs: Vec<E>,
+        bl: &crate::pre_tokenizers::byte_level::ByteLevel,
+        add_special_tokens: bool,
+    ) -> Result<Vec<Encoding>>
+    where
+        E: Into<EncodeInput<'s>> + Send,
+    {
+        let n = inputs.len();
+        if n == 0 {
+            return Ok(vec![]);
+        }
+
+        let encode_raw = |seq: &str, type_id: u32| -> Result<Encoding> {
+            bl.encode_ids_fast(
+                seq,
+                |segment, out| self.model.tokenize_ids_into_fused(segment, out),
+                type_id,
+            )
+        };
+
+        let encode_one = |input: EncodeInput<'s>| -> Result<Encoding> {
+            let (sequence, pair) = match input {
+                EncodeInput::Single(s1) => (s1, None),
+                EncodeInput::Dual(s1, s2) => (s1, Some(s2)),
+            };
+            let encoding = match sequence {
+                InputSequence::Raw(ref seq) => encode_raw(seq.as_ref(), 0)?,
+                other => self.encode_single_sequence(other, 0, OffsetType::None)?,
+            };
+            let pair_encoding = pair
+                .map(|seq| match seq {
+                    InputSequence::Raw(ref s) => encode_raw(s.as_ref(), 1),
+                    other => self.encode_single_sequence(other, 1, OffsetType::None),
+                })
+                .transpose()?;
+            let out = self.post_process(encoding, pair_encoding, add_special_tokens);
+            self.model.flush_cache();
+            out
+        };
+
+        let pool = crate::utils::pool::global_pool();
+        let parallelism = get_parallelism();
+        let num_threads = if parallelism {
+            pool.num_threads().min(n)
+        } else {
+            1
+        };
+
+        if num_threads <= 1 {
+            return inputs
+                .into_iter()
+                .map(|input| encode_one(input.into()))
+                .collect::<Result<Vec<Encoding>>>();
+        }
+
+        let inputs = TakeVec::new(
+            inputs
+                .into_iter()
+                .map(|e| e.into())
+                .collect::<Vec<EncodeInput<'s>>>(),
+        );
+        let results: ResultVec<Result<Encoding>> = ResultVec::new(n);
+        let queue = BatchWorkQueue::new(n, num_threads);
+
+        pool.broadcast(|tid| {
+            if tid >= num_threads {
+                return;
+            }
+            while let Some((start, end)) = queue.claim_window() {
+                for i in start..end {
+                    let input = inputs.take(i);
+                    results.set(i, encode_one(input));
+                }
+            }
+        });
+
+        results
+            .into_vec()
+            .into_iter()
+            .collect::<Result<Vec<Encoding>>>()
     }
 
     /// Shared implementation for all batch encode variants.
