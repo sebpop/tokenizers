@@ -1106,10 +1106,13 @@ where
             i += 1;
         }
 
-        // Safety: all bytes come from vocab_decoded (built from valid token
-        // strings via build_vocab_decoded) or from added-vocab tok.content
-        // (a valid String).
-        Some(Ok(unsafe { String::from_utf8_unchecked(buf) }))
+        // When byte_fallback tokens are pre-decoded, individual bytes may
+        // form partial UTF-8 sequences.  Use from_utf8 for the fast path
+        // (valid UTF-8, zero-copy), with from_utf8_lossy fallback to
+        // replace incomplete sequences with the replacement character.
+        Some(Ok(String::from_utf8(buf).unwrap_or_else(|e| {
+            String::from_utf8_lossy(e.as_bytes()).into_owned()
+        })))
     }
 
     /// Decode the given ids, back to a String

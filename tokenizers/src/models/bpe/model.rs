@@ -60,9 +60,13 @@ impl FlatVocabDecoded {
     }
 }
 
-/// Pre-compute ByteLevel-decoded bytes for each entry in vocab_r_vec
-/// and pack them into a flat contiguous buffer.
-pub(crate) fn build_vocab_decoded(vocab_r_vec: &[String]) -> FlatVocabDecoded {
+/// Pre-compute decoded bytes for each entry in vocab_r_vec and pack them
+/// into a flat contiguous buffer.  Handles ByteLevel char->byte mapping
+/// and, when `byte_fallback` is true, `<0xHH>` -> single-byte decoding.
+pub(crate) fn build_vocab_decoded(
+    vocab_r_vec: &[String],
+    byte_fallback: bool,
+) -> FlatVocabDecoded {
     let table = &*CHAR_BYTES_TABLE;
 
     let mut bytes = Vec::with_capacity(vocab_r_vec.len() * 4);
@@ -73,6 +77,21 @@ pub(crate) fn build_vocab_decoded(vocab_r_vec: &[String]) -> FlatVocabDecoded {
         if token.is_empty() {
             continue;
         }
+        // ByteFallback tokens like "<0x20>" must be checked first: their
+        // characters are printable ASCII that would pass the ByteLevel
+        // mapping, producing the 6-byte literal instead of the single
+        // decoded byte.
+        if byte_fallback
+            && token.len() == 6
+            && token.starts_with("<0x")
+            && token.ends_with('>')
+        {
+            if let Ok(b) = u8::from_str_radix(&token[3..5], 16) {
+                bytes.push(b);
+                continue;
+            }
+        }
+        // Try ByteLevel char->byte mapping.
         let start = bytes.len();
         let mut all_mapped = true;
         for c in token.chars() {
@@ -85,8 +104,11 @@ pub(crate) fn build_vocab_decoded(vocab_r_vec: &[String]) -> FlatVocabDecoded {
             }
         }
         if !all_mapped {
+            // Token has characters outside ByteLevel range and isn't a
+            // ByteFallback token -- it needs runtime decoder processing
+            // (e.g., Metaspace).  Leave an empty entry so decode_fused
+            // falls back to the decoder-based slow path.
             bytes.truncate(start);
-            bytes.extend_from_slice(token.as_bytes());
         }
     }
     offsets.push(bytes.len() as u32);
@@ -316,7 +338,7 @@ impl BpeBuilder {
         for (&id, token) in &vocab_r {
             vocab_r_vec[id as usize] = token.clone();
         }
-        let vocab_decoded = build_vocab_decoded(&vocab_r_vec);
+        let vocab_decoded = build_vocab_decoded(&vocab_r_vec, self.config.byte_fallback);
         let cache = match self.config.cache_capacity {
             0 => None,
             capacity => Some(Cache::new(capacity)),

@@ -622,7 +622,8 @@ impl BpeTrainer {
         for (&id, token) in &model.vocab_r {
             model.vocab_r_vec[id as usize] = token.clone();
         }
-        model.vocab_decoded = super::model::build_vocab_decoded(&model.vocab_r_vec);
+        model.vocab_decoded =
+            super::model::build_vocab_decoded(&model.vocab_r_vec, model.byte_fallback);
         model.merges = super::MergeMap::from_iter(
             merges
                 .into_iter()
