@@ -382,6 +382,23 @@ impl BpeBuilder {
             }
         }
 
+        let mut byte_pair_initial = vec![(u32::MAX, 0u32); 65536];
+        for b1 in 0u16..256 {
+            let t1 = byte_to_initial_token[b1 as usize];
+            if t1 == u32::MAX {
+                continue;
+            }
+            for b2 in 0u16..256 {
+                let t2 = byte_to_initial_token[b2 as usize];
+                if t2 == u32::MAX {
+                    continue;
+                }
+                if let Some((rank, new_id)) = merge_map.get(&(t1, t2)) {
+                    byte_pair_initial[b1 as usize * 256 + b2 as usize] = (rank, new_id);
+                }
+            }
+        }
+
         Ok(BPE {
             vocab,
             vocab_r,
@@ -397,6 +414,7 @@ impl BpeBuilder {
             byte_fallback: self.config.byte_fallback,
             ignore_merges: self.config.ignore_merges,
             byte_to_initial_token,
+            byte_pair_initial,
         })
     }
 }
@@ -438,6 +456,10 @@ pub struct BPE {
     /// BPE path.  Eliminates per-byte vocab hash lookups.  `u32::MAX` means
     /// the byte has no mapping (should not happen for byte-level vocabs).
     byte_to_initial_token: [u32; 256],
+    /// Pre-computed 256x256 byte-pair merge table for O(1) initial merge
+    /// seeding.  `byte_pair_initial[b1 * 256 + b2] = (rank, new_id)`.
+    /// `(u32::MAX, 0)` means no merge for that byte pair.  512KB, fits in L2.
+    byte_pair_initial: Vec<(u32, u32)>,
 }
 
 impl std::fmt::Debug for BPE {
@@ -482,6 +504,7 @@ impl Clone for BPE {
             byte_fallback: self.byte_fallback,
             ignore_merges: self.ignore_merges,
             byte_to_initial_token: self.byte_to_initial_token,
+            byte_pair_initial: self.byte_pair_initial.clone(),
         }
     }
 }
@@ -673,6 +696,7 @@ impl BPE {
 
     /// Fused byte-level merge: map raw bytes directly to initial token IDs
     /// via `byte_to_initial_token`, skipping the char-encoding roundtrip.
+    /// Uses the 256x256 byte-pair table for O(1) initial merge seeding.
     fn merge_word_fused(&self, raw: &str) -> Result<Word> {
         let bytes = raw.as_bytes();
         let mut word = Word::with_capacity(bytes.len());
@@ -685,7 +709,7 @@ impl BPE {
             }
             word.add(id, 1);
         }
-        word.merge_all(&self.merges, self.dropout);
+        word.merge_all_fused(bytes, &self.byte_pair_initial, &self.merges, self.dropout);
         Ok(word)
     }
 

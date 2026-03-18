@@ -255,6 +255,94 @@ impl Word {
         self.symbols.retain(|s| s.len != 0);
     }
 
+    /// Fused merge: seed the heap from a pre-computed 256×256 byte-pair
+    /// table (O(1) per pair) instead of MergeMap binary search.  Subsequent
+    /// merges still use `merges` since merged tokens leave the byte range.
+    pub(super) fn merge_all_fused(
+        &mut self,
+        raw_bytes: &[u8],
+        byte_pair_initial: &[(u32, u32)],
+        merges: &MergeMap,
+        dropout: Option<f32>,
+    ) {
+        let mut queue = QuaternaryHeap::with_capacity(self.symbols.len());
+        let mut skip = Vec::with_capacity(queue.len());
+
+        for i in 0..raw_bytes.len().saturating_sub(1) {
+            let (rank, new_id) =
+                byte_pair_initial[raw_bytes[i] as usize * 256 + raw_bytes[i + 1] as usize];
+            if rank != u32::MAX {
+                queue.push(Merge {
+                    pos: i,
+                    rank,
+                    new_id,
+                });
+            }
+        }
+
+        while let Some(top) = queue.pop() {
+            if dropout.map(|d| rng().random::<f32>() < d).unwrap_or(false) {
+                skip.push(top);
+            } else {
+                queue.extend(skip.drain(..));
+
+                if self.symbols[top.pos].len == 0 {
+                    continue;
+                }
+                if self.symbols[top.pos].next == -1 {
+                    continue;
+                }
+
+                let next_pos = self.symbols[top.pos].next as usize;
+                let right = self.symbols[next_pos];
+
+                let target_new_pair = (self.symbols[top.pos].c, right.c);
+                if merges
+                    .get(&target_new_pair)
+                    .is_none_or(|(_, new_id)| new_id != top.new_id)
+                {
+                    continue;
+                }
+
+                self.symbols[top.pos].merge_with(&right, top.new_id);
+                self.symbols[next_pos].len = 0;
+
+                if right.next > -1 && (right.next as usize) < self.symbols.len() {
+                    self.symbols[right.next as usize].prev = top.pos as isize;
+                }
+
+                let current = &self.symbols[top.pos];
+                if current.prev >= 0 {
+                    let prev = current.prev as usize;
+                    let prev_symbol = self.symbols[prev];
+                    let new_pair = (prev_symbol.c, current.c);
+                    if let Some((rank, new_id)) = merges.get(&new_pair) {
+                        queue.push(Merge {
+                            pos: current.prev as usize,
+                            rank,
+                            new_id,
+                        });
+                    }
+                }
+
+                let next = current.next as usize;
+                if next < self.symbols.len() {
+                    let next_symbol = self.symbols[next];
+                    let new_pair = (current.c, next_symbol.c);
+                    if let Some((rank, new_id)) = merges.get(&new_pair) {
+                        queue.push(Merge {
+                            pos: top.pos,
+                            rank,
+                            new_id,
+                        });
+                    }
+                }
+            }
+        }
+
+        self.symbols.retain(|s| s.len != 0);
+    }
+
     pub(super) fn get_chars(&self) -> Vec<u32> {
         self.symbols.iter().map(|s| s.c).collect()
     }
