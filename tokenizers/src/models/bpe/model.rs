@@ -139,56 +139,122 @@ pub type Vocab = AHashMap<String, u32>;
 type VocabR = AHashMap<u32, String>;
 pub type Merges = Vec<(String, String)>;
 
-/// Sorted merge table for cache-friendly pair lookups.
+const EMPTY_KEY: u64 = u64::MAX;
+
+#[inline(always)]
+fn fx_hash(key: u64) -> u64 {
+    key.wrapping_mul(0x517cc1b727220a95)
+}
+
+/// Open-addressing hash table with FxHash for O(1) amortized merge lookups.
 ///
-/// AHashMap scatters 50K entries across ~1.2 MB with randomized bucket
-/// placement, causing L1d misses on every probe.  This sorted array
-/// uses binary search: O(log 50256) = 16 probes where the top ~10
-/// levels stay hot in L1d cache.
-#[derive(Clone, Debug, PartialEq)]
+/// ~50% load factor limits probe chains.  FxHash is not cryptographic but
+/// BPE merge keys (sequential token IDs packed into u64) are well-distributed.
+/// For GPT-2 (~50K merges), this uses ~1.6MB at 50% load (fits in L2).
+#[derive(Clone)]
 pub struct MergeMap {
-    /// Sorted by encoded key `(left << 32 | right)`.
-    entries: Vec<(u64, u32, u32)>,
+    mask: usize,
+    /// Interleaved (key, rank, new_id) slots.  key == EMPTY_KEY means empty.
+    slots: Vec<(u64, u32, u32)>,
+    count: usize,
+}
+
+impl std::fmt::Debug for MergeMap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MergeMap")
+            .field("count", &self.count)
+            .finish()
+    }
+}
+
+impl PartialEq for MergeMap {
+    fn eq(&self, other: &Self) -> bool {
+        if self.count != other.count {
+            return false;
+        }
+        for (pair, val) in self.iter() {
+            if other.get(&pair) != Some(val) {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 impl MergeMap {
-    pub fn with_capacity(cap: usize) -> Self {
+    pub fn with_capacity(_cap: usize) -> Self {
         Self {
-            entries: Vec::with_capacity(cap),
+            mask: 0,
+            slots: Vec::new(),
+            count: 0,
         }
     }
 
     /// Build from an iterator of `(Pair, (rank, new_id))`.
     pub fn from_iter(iter: impl Iterator<Item = (Pair, (u32, u32))>) -> Self {
-        let mut entries: Vec<(u64, u32, u32)> = iter
-            .map(|((left, right), (rank, new_id))| {
-                ((left as u64) << 32 | right as u64, rank, new_id)
-            })
-            .collect();
-        entries.sort_unstable_by_key(|&(key, _, _)| key);
-        Self { entries }
+        let items: Vec<_> = iter.collect();
+        if items.is_empty() {
+            return Self {
+                mask: 0,
+                slots: Vec::new(),
+                count: 0,
+            };
+        }
+        let capacity = (items.len() * 2).next_power_of_two();
+        let mask = capacity - 1;
+        let mut slots = vec![(EMPTY_KEY, 0u32, 0u32); capacity];
+
+        for ((left, right), (rank, new_id)) in &items {
+            let key = (*left as u64) << 32 | *right as u64;
+            let mut idx = fx_hash(key) as usize & mask;
+            loop {
+                if slots[idx].0 == EMPTY_KEY {
+                    slots[idx] = (key, *rank, *new_id);
+                    break;
+                }
+                idx = (idx + 1) & mask;
+            }
+        }
+        Self {
+            mask,
+            slots,
+            count: items.len(),
+        }
     }
 
     #[inline]
     pub fn get(&self, pair: &Pair) -> Option<(u32, u32)> {
+        if self.slots.is_empty() {
+            return None;
+        }
         let key = (pair.0 as u64) << 32 | pair.1 as u64;
-        self.entries
-            .binary_search_by_key(&key, |&(k, _, _)| k)
-            .ok()
-            .map(|idx| (self.entries[idx].1, self.entries[idx].2))
+        let mut idx = fx_hash(key) as usize & self.mask;
+        loop {
+            let slot = unsafe { self.slots.get_unchecked(idx) };
+            if slot.0 == key {
+                return Some((slot.1, slot.2));
+            }
+            if slot.0 == EMPTY_KEY {
+                return None;
+            }
+            idx = (idx + 1) & self.mask;
+        }
     }
 
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.count
     }
 
     /// Iterate as `(Pair, (rank, new_id))` for serialization.
     pub fn iter(&self) -> impl Iterator<Item = (Pair, (u32, u32))> + '_ {
-        self.entries.iter().map(|&(key, rank, new_id)| {
-            let left = (key >> 32) as u32;
-            let right = key as u32;
-            ((left, right), (rank, new_id))
-        })
+        self.slots
+            .iter()
+            .filter(|&&(key, _, _)| key != EMPTY_KEY)
+            .map(|&(key, rank, new_id)| {
+                let left = (key >> 32) as u32;
+                let right = key as u32;
+                ((left, right), (rank, new_id))
+            })
     }
 }
 
