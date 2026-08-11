@@ -1357,16 +1357,8 @@ where
     where
         E: Into<EncodeInput<'s>> + Send,
     {
-        #[cfg(feature = "parallelism")]
-        let mut encodings = inputs
-            .into_maybe_par_iter()
-            .map(|input| self.encode(input, add_special_tokens))
-            .collect::<Result<Vec<Encoding>>>()?;
-        #[cfg(not(feature = "parallelism"))]
-        let mut encodings = inputs
-            .into_iter()
-            .map(|input| self.encode(input, add_special_tokens))
-            .collect::<Result<Vec<Encoding>>>()?;
+        let mut encodings =
+            self.run_batch(inputs, |this, input| this.encode(input, add_special_tokens))?;
 
         if let Some(params) = &self.padding {
             // We do the padding here to make sure we handle the batch padding
@@ -1386,16 +1378,9 @@ where
     where
         E: Into<EncodeInput<'s>> + Send,
     {
-        #[cfg(feature = "parallelism")]
-        let mut encodings = inputs
-            .into_maybe_par_iter()
-            .map(|input| self.encode_char_offsets(input, add_special_tokens))
-            .collect::<Result<Vec<Encoding>>>()?;
-        #[cfg(not(feature = "parallelism"))]
-        let mut encodings = inputs
-            .into_iter()
-            .map(|input| self.encode_char_offsets(input, add_special_tokens))
-            .collect::<Result<Vec<Encoding>>>()?;
+        let mut encodings = self.run_batch(inputs, |this, input| {
+            this.encode_char_offsets(input, add_special_tokens)
+        })?;
 
         if let Some(params) = &self.padding {
             // We do the padding here to make sure we handle the batch padding
@@ -1414,16 +1399,9 @@ where
     where
         E: Into<EncodeInput<'s>> + Send,
     {
-        #[cfg(feature = "parallelism")]
-        let mut encodings = inputs
-            .into_maybe_par_iter()
-            .map(|input| self.encode_fast(input, add_special_tokens))
-            .collect::<Result<Vec<Encoding>>>()?;
-        #[cfg(not(feature = "parallelism"))]
-        let mut encodings = inputs
-            .into_iter()
-            .map(|input| self.encode_fast(input, add_special_tokens))
-            .collect::<Result<Vec<Encoding>>>()?;
+        let mut encodings = self.run_batch(inputs, |this, input| {
+            this.encode_fast(input, add_special_tokens)
+        })?;
 
         if let Some(params) = &self.padding {
             // We do the padding here to make sure we handle the batch padding
@@ -1431,6 +1409,80 @@ where
         }
 
         Ok(encodings)
+    }
+
+    /// Shared implementation for the batch-encode entry points.
+    ///
+    /// Applies `encode_fn` to every input, in parallel when parallelism is
+    /// enabled and more than one worker is available.
+    ///
+    /// Parallel work is distributed with rayon's
+    /// `IndexedParallelIterator::with_min_len`, which sets a floor on the
+    /// number of items a single rayon task processes sequentially. Without
+    /// that floor rayon's `bridge_producer_consumer` splits the batch down to
+    /// one item per task; at high core counts the per-task wake/join signaling
+    /// plus crossbeam-epoch reclamation then dominate (on a 176-thread aarch64
+    /// box they were ~50% of cycles and capped throughput at <10 effective
+    /// cores). Coarsening tasks to `min_len` items amortizes that overhead
+    /// while still handing each worker several tasks for load balance.
+    fn run_batch<'s, E, F>(&self, inputs: Vec<E>, encode_fn: F) -> Result<Vec<Encoding>>
+    where
+        E: Into<EncodeInput<'s>> + Send,
+        F: Fn(&Self, EncodeInput<'s>) -> Result<Encoding> + Sync,
+    {
+        let n = inputs.len();
+        if n == 0 {
+            return Ok(vec![]);
+        }
+
+        #[cfg(feature = "parallelism")]
+        {
+            use crate::utils::parallelism::{
+                current_num_threads, get_parallelism, set_parallelism_used,
+            };
+            use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
+
+            if get_parallelism() {
+                // Mirror the side effect of `into_maybe_par_iter`: record that
+                // the rayon pool may be used, so the Python `pthread_atfork`
+                // hook disables parallelism in forked children.
+                set_parallelism_used();
+                let num_threads = current_num_threads().min(n);
+                if num_threads > 1 {
+                    // Coarsen the rayon tasks so that per-task wake/join signaling
+                    // and crossbeam-epoch reclamation are amortized. Two bounds on
+                    // `min_len` (the floor on how many inputs one task handles):
+                    //
+                    //  * cap the task COUNT at ~MAX_TASKS_PER_THREAD * workers, so
+                    //    a large batch is not split into thousands of tiny tasks
+                    //    (the case that drowns the scheduler in crossbeam-epoch
+                    //    reclamation on many-core CPUs); and
+                    //  * require at least MIN_ITEMS_PER_TASK inputs per task, so a
+                    //    small/medium batch on many workers is still coarsened
+                    //    rather than left at rayon's default one-item split.
+                    //
+                    // Without the second bound, `ceil(n / (workers * K))` rounds to
+                    // 1 whenever n < workers * K (e.g. a 1000-item batch on 88
+                    // workers), i.e. no coarsening happens exactly where it is easy
+                    // to apply.
+                    const MAX_TASKS_PER_THREAD: usize = 16;
+                    const MIN_ITEMS_PER_TASK: usize = 8;
+                    let min_len = n
+                        .div_ceil(num_threads.saturating_mul(MAX_TASKS_PER_THREAD).max(1))
+                        .max(MIN_ITEMS_PER_TASK);
+                    return inputs
+                        .into_par_iter()
+                        .with_min_len(min_len)
+                        .map(|input| encode_fn(self, input.into()))
+                        .collect();
+                }
+            }
+        }
+
+        inputs
+            .into_iter()
+            .map(|input| encode_fn(self, input.into()))
+            .collect()
     }
 
     /// Decode all sentences in parallel
